@@ -5,6 +5,7 @@ import uuid
 from typing import Optional, List
 import sys
 import platform
+import traceback
 
 # Import numpy first and set environment variable to prevent _ARRAY_API error on M1 Macs
 os.environ["NUMPY_EXPERIMENTAL_ARRAY_FUNCTION"] = "0"
@@ -33,10 +34,11 @@ from pydantic import BaseModel
 import logging
 import traceback
 
-# Set up logging configuration
+# Enhanced logging configuration
+log_level = os.getenv("LOG_LEVEL", "DEBUG").upper()  # Set default to DEBUG for more visibility
 logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=getattr(logging, log_level),
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s - [%(filename)s:%(lineno)d]',
     handlers=[
         logging.StreamHandler(),  # Log to console
         logging.FileHandler("app.log")  # Also log to a file
@@ -44,14 +46,20 @@ logging.basicConfig(
 )
 logger = logging.getLogger("geez-translate")
 
+# Log startup information immediately
+logger.info("=====================================================")
+logger.info("APPLICATION STARTING - Enhanced Logging Enabled")
+logger.info(f"Log level set to: {log_level}")
+logger.info("=====================================================")
+
 # Configure GPU memory growth to avoid OOM errors
 if torch.cuda.is_available():
     # Optional - configure GPU memory growth
     torch.cuda.empty_cache()
-    print(f"Using GPU: {torch.cuda.get_device_name(0)}")
-    print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB")
+    logger.info(f"Using GPU: {torch.cuda.get_device_name(0)}")
+    logger.info(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB")
 else:
-    print("GPU not available, using CPU")
+    logger.info("GPU not available, using CPU")
 
 # Create FastAPI app
 app = FastAPI(
@@ -97,6 +105,14 @@ MAX_AUDIO_LENGTH = int(os.getenv("MAX_AUDIO_LENGTH", "300"))  # Max audio length
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 LOAD_MODEL_ON_STARTUP = os.getenv("LOAD_MODEL_ON_STARTUP", "false").lower() == "true"
 
+# Log important configuration settings
+logger.info(f"MODEL_ID: {MODEL_ID}")
+logger.info(f"LOCAL_MODEL: {LOCAL_MODEL}")
+logger.info(f"BATCH_SIZE: {BATCH_SIZE}")
+logger.info(f"MAX_AUDIO_LENGTH: {MAX_AUDIO_LENGTH}")
+logger.info(f"DEVICE: {DEVICE}")
+logger.info(f"LOAD_MODEL_ON_STARTUP: {LOAD_MODEL_ON_STARTUP}")
+
 # In-memory queues for processing and results
 processing_queue = {}
 completed_jobs = {}
@@ -125,10 +141,12 @@ async def load_model():
         # Import here to avoid initial import errors
         try:
             from transformers import AutoProcessor, SeamlessM4Tv2ForSpeechToText
-        except ImportError:
-            logger.error("Failed to import from transformers. Make sure transformers is installed correctly.")
+            logger.info("Successfully imported transformers modules")
+        except ImportError as e:
+            logger.error(f"Failed to import from transformers: {str(e)}")
+            logger.error(traceback.format_exc())
             model_loading_lock = False
-            return {"status": "error", "message": "Failed to import required libraries"}
+            return {"status": "error", "message": f"Failed to import required libraries: {str(e)}"}
         
         # Load processor first
         try:
@@ -146,6 +164,7 @@ async def load_model():
             logger.info(f"Loading model on {DEVICE}...")
             # For M1 Mac compatibility, use chunked loading
             if "arm64" in platform.machine().lower() and DEVICE == "cpu":
+                logger.info("Detected ARM64 platform, using float32 precision")
                 model = SeamlessM4Tv2ForSpeechToText.from_pretrained(
                     MODEL_ID, 
                     low_cpu_mem_usage=True,
@@ -153,6 +172,7 @@ async def load_model():
                 ).to(DEVICE)
             else:
                 # For GPU, use half precision and better memory optimization
+                logger.info("Using GPU optimization with float16 precision")
                 model = SeamlessM4Tv2ForSpeechToText.from_pretrained(
                     MODEL_ID,
                     torch_dtype=torch.float16 if DEVICE == "cuda" else None,
@@ -189,7 +209,8 @@ async def startup_event():
     
     if LOAD_MODEL_ON_STARTUP:
         logger.info("Loading model on startup as configured...")
-        await load_model()
+        result = await load_model()
+        logger.info(f"Model loading result: {result}")
     else:
         logger.info("Model loading on startup disabled. Use /load-model endpoint to load it.")
     
@@ -208,12 +229,27 @@ def process_audio(audio_path, target_language="amh"):
         # Log some information about the audio file
         logger.info(f"Processing audio file: {audio_path}, target language: {target_language}")
         
+        # Check if file exists and is readable
+        if not os.path.exists(audio_path):
+            logger.error(f"Audio file does not exist: {audio_path}")
+            raise FileNotFoundError(f"Audio file does not exist: {audio_path}")
+            
+        if not os.access(audio_path, os.R_OK):
+            logger.error(f"Cannot read audio file (permission denied): {audio_path}")
+            raise PermissionError(f"Cannot read audio file: {audio_path}")
+            
+        # Get file size
+        file_size = os.path.getsize(audio_path)
+        logger.info(f"Audio file size: {file_size} bytes")
+        
         # Load audio file
         try:
+            logger.info(f"Loading audio file: {audio_path}")
             audio, sample_rate = librosa.load(audio_path, sr=None)
             logger.info(f"Audio loaded successfully: length={len(audio)}, sample_rate={sample_rate}")
         except Exception as e:
             logger.error(f"Error loading audio file: {str(e)}")
+            logger.error(traceback.format_exc())
             raise ValueError(f"Could not load audio file: {str(e)}")
         
         # Check audio length
@@ -236,6 +272,7 @@ def process_audio(audio_path, target_language="amh"):
             logger.info(f"Input created successfully: {inputs.keys()}")
         except Exception as e:
             logger.error(f"Error creating inputs: {str(e)}")
+            logger.error(traceback.format_exc())
             raise ValueError(f"Failed to process audio: {str(e)}")
         
         # Generate transcription with improved error handling
@@ -243,11 +280,13 @@ def process_audio(audio_path, target_language="amh"):
         try:
             # Set a timeout for generation to prevent hangs
             with torch.no_grad(), torch.cuda.amp.autocast(enabled=DEVICE=="cuda"):
+                logger.info("Starting model generation with no_grad and autocast")
                 output_tokens = model.generate(
                     **inputs,
                     tgt_lang=target_language,
                     num_beams=1  # Use greedy decoding for faster inference
                 )
+                logger.info("Model generation completed")
             
             torch.cuda.empty_cache()  # Clear CUDA cache after generation
             logger.info(f"Generation successful: output shape={output_tokens.shape}")
@@ -268,10 +307,12 @@ def process_audio(audio_path, target_language="amh"):
         
         # Decode the tokens
         try:
+            logger.info("Decoding tokens...")
             transcribed_text = processor.decode(output_tokens[0].tolist(), skip_special_tokens=True)
             logger.info(f"Transcription result: '{transcribed_text[:50]}...' (length={len(transcribed_text)})")
         except Exception as e:
             logger.error(f"Error decoding tokens: {str(e)}")
+            logger.error(traceback.format_exc())
             raise ValueError(f"Failed to decode transcription: {str(e)}")
         
         processing_time = time.time() - start_time
@@ -297,39 +338,75 @@ def process_audio(audio_path, target_language="amh"):
 
 async def process_audio_task(file_path, job_id, target_language):
     """Background task to process audio and store results"""
-    logger.info(f"Starting background task for job {job_id} with file {file_path}")
+    logger.info(f"--- STARTING BACKGROUND TASK ---")
+    logger.info(f"Background task for job {job_id} with file {file_path}")
     
-    result = process_audio(file_path, target_language)
-    result["id"] = job_id
-    
-    if result["status"] == "error":
-        logger.error(f"Job {job_id} failed: {result.get('error', 'Unknown error')}")
-    else:
-        logger.info(f"Job {job_id} completed successfully")
-    
-    completed_jobs[job_id] = result
-    
-    # Clean up temp file
-    if os.path.exists(file_path):
+    try:
+        # Check if file exists and is readable before processing
+        if not os.path.exists(file_path):
+            logger.error(f"Audio file does not exist: {file_path}")
+            completed_jobs[job_id] = {
+                "id": job_id,
+                "text": "",
+                "processing_time": 0,
+                "status": "error",
+                "error": f"Audio file not found: {file_path}"
+            }
+            return
+        
+        logger.info(f"Processing audio for job {job_id}")
+        result = process_audio(file_path, target_language)
+        result["id"] = job_id
+        
+        if result["status"] == "error":
+            logger.error(f"Job {job_id} failed: {result.get('error', 'Unknown error')}")
+        else:
+            logger.info(f"Job {job_id} completed successfully")
+        
+        # Store the result
+        logger.info(f"Storing result for job {job_id}")
+        completed_jobs[job_id] = result
+        logger.info(f"Result stored for job {job_id}")
+        
+    except Exception as e:
+        logger.error(f"Unexpected error in process_audio_task for job {job_id}: {str(e)}")
+        logger.error(traceback.format_exc())
+        completed_jobs[job_id] = {
+            "id": job_id,
+            "text": "",
+            "processing_time": 0,
+            "status": "error",
+            "error": f"Task execution failed: {str(e)}"
+        }
+    finally:
+        # Clean up temp file
         try:
-            os.remove(file_path)
-            logger.info(f"Temporary file {file_path} removed")
+            if os.path.exists(file_path):
+                logger.info(f"Removing temporary file {file_path}")
+                os.remove(file_path)
+                logger.info(f"Temporary file {file_path} removed")
         except Exception as e:
             logger.warning(f"Failed to remove temporary file {file_path}: {str(e)}")
-    
-    # Remove from processing queue
-    if job_id in processing_queue:
-        del processing_queue[job_id]
-        logger.info(f"Job {job_id} removed from processing queue")
+        
+        # Remove from processing queue
+        if job_id in processing_queue:
+            logger.info(f"Removing job {job_id} from processing queue")
+            del processing_queue[job_id]
+            logger.info(f"Job {job_id} removed from processing queue")
+        
+        logger.info(f"--- BACKGROUND TASK COMPLETED ---")
 
 # API Endpoints
 @app.post("/load-model")
 async def load_model_endpoint():
     """Endpoint to manually load the model"""
+    logger.info("Manual model loading requested")
     if model is not None and processor is not None:
+        logger.info("Model is already loaded")
         return {"status": "already_loaded", "message": "Model is already loaded"}
     
     result = await load_model()
+    logger.info(f"Manual model loading result: {result}")
     return result
 
 @app.post("/transcribe", response_model=QueuedResponse)
@@ -342,11 +419,15 @@ async def transcribe_audio(
     Transcribe an audio file to text.
     Returns job ID immediately and processes in the background.
     """
+    logger.info(f"Transcribe request received for file: {file.filename}, target: {target_language}")
+    
     # Check if model is loaded
     if model is None or processor is None:
+        logger.info("Model not loaded, attempting to load it now")
         # Try to load the model if it's not loaded yet
         load_result = await load_model()
         if load_result["status"] != "success" and load_result["status"] != "already_loaded":
+            logger.error(f"Model could not be loaded: {load_result}")
             raise HTTPException(
                 status_code=503, 
                 detail="Model could not be loaded. Please try again later or use the /load-model endpoint first."
@@ -354,13 +435,29 @@ async def transcribe_audio(
         
     # Generate a unique ID for this job
     job_id = str(uuid.uuid4())
+    logger.info(f"Generated job ID: {job_id}")
     
     # Save the uploaded file temporarily
+    logger.info(f"Saving uploaded file to temp location")
     with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_file:
-        temp_file.write(await file.read())
+        logger.info(f"Created temp file: {temp_file.name}")
+        content = await file.read()
+        logger.info(f"Read {len(content)} bytes from uploaded file")
+        temp_file.write(content)
         temp_file_path = temp_file.name
     
+    logger.info(f"File saved to: {temp_file_path}")
+    
+    # Check if the file was saved correctly
+    if os.path.exists(temp_file_path):
+        file_size = os.path.getsize(temp_file_path)
+        logger.info(f"Temporary file exists, size: {file_size} bytes")
+    else:
+        logger.error(f"Temporary file was not created successfully: {temp_file_path}")
+        raise HTTPException(status_code=500, detail="Failed to save uploaded file")
+    
     # Add to processing queue
+    logger.info(f"Adding job {job_id} to processing queue")
     processing_queue[job_id] = {
         "file_path": temp_file_path,
         "target_language": target_language,
@@ -369,7 +466,9 @@ async def transcribe_audio(
     }
     
     # Process in background
+    logger.info(f"Adding background task for job {job_id}")
     background_tasks.add_task(process_audio_task, temp_file_path, job_id, target_language)
+    logger.info(f"Background task added for job {job_id}")
     
     # Return the job ID immediately
     return QueuedResponse(
@@ -399,6 +498,9 @@ async def check_status(job_id: str, debug: bool = False):
     # Check if job is in queue
     if job_id in processing_queue:
         logger.info(f"Job {job_id} is still in processing queue")
+        time_in_queue = time.time() - processing_queue[job_id]["start_time"]
+        logger.info(f"Job {job_id} has been in queue for {time_in_queue:.2f} seconds")
+        
         return TranscriptionResponse(
             id=job_id,
             text="",
@@ -417,11 +519,15 @@ async def batch_process(
     target_language: str = Form("amh")
 ):
     """Process multiple audio files in batch"""
+    logger.info(f"Batch process request received for {len(files)} files")
+    
     # Check if model is loaded
     if model is None or processor is None:
+        logger.info("Model not loaded for batch processing, attempting to load it now")
         # Try to load the model if it's not loaded yet
         load_result = await load_model()
         if load_result["status"] != "success" and load_result["status"] != "already_loaded":
+            logger.error(f"Model could not be loaded for batch processing: {load_result}")
             raise HTTPException(
                 status_code=503, 
                 detail="Model could not be loaded. Please try again later or use the /load-model endpoint first."
@@ -429,16 +535,24 @@ async def batch_process(
         
     responses = []
     
-    for file in files:
+    for i, file in enumerate(files):
+        logger.info(f"Processing batch file {i+1}/{len(files)}: {file.filename}")
+        
         # Generate a unique ID for this job
         job_id = str(uuid.uuid4())
+        logger.info(f"Generated job ID for batch item: {job_id}")
         
         # Save the uploaded file temporarily
+        logger.info(f"Saving batch file to temp location")
         with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_file:
-            temp_file.write(await file.read())
+            logger.info(f"Created temp file for batch item: {temp_file.name}")
+            content = await file.read()
+            logger.info(f"Read {len(content)} bytes from batch file")
+            temp_file.write(content)
             temp_file_path = temp_file.name
         
         # Add to processing queue
+        logger.info(f"Adding batch job {job_id} to processing queue")
         processing_queue[job_id] = {
             "file_path": temp_file_path,
             "target_language": target_language,
@@ -447,18 +561,23 @@ async def batch_process(
         }
         
         # Process in background
+        logger.info(f"Adding background task for batch job {job_id}")
         background_tasks.add_task(process_audio_task, temp_file_path, job_id, target_language)
+        logger.info(f"Background task added for batch job {job_id}")
         
         responses.append(QueuedResponse(
             id=job_id,
             status="processing"
         ))
     
+    logger.info(f"Returning {len(responses)} batch job responses")
     return responses
 
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
+    logger.info("Health check requested")
+    
     # Get system information
     system_info = {
         "python_version": sys.version,
@@ -476,7 +595,7 @@ async def health_check():
             "gpu_memory_total": f"{torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB",
         }
     
-    return {
+    response = {
         "status": "healthy",
         "model_loaded": model is not None,
         "processor_loaded": processor is not None,
@@ -486,12 +605,117 @@ async def health_check():
         "completed_jobs": len(completed_jobs),
         "device": DEVICE,
         "system_info": system_info,
-        "gpu_info": gpu_info
+        "gpu_info": gpu_info,
+        "timestamp": time.time()
+    }
+    
+    # Log queue details for debugging
+    if processing_queue:
+        logger.info(f"Current processing queue ({len(processing_queue)} jobs):")
+        for job_id, job_info in processing_queue.items():
+            queue_time = time.time() - job_info["start_time"]
+            logger.info(f"  - Job {job_id}: in queue for {queue_time:.2f}s")
+    
+    return response
+
+@app.get("/queue-status")
+async def queue_status():
+    """Get detailed information about the processing queue"""
+    logger.info("Queue status requested")
+    
+    queue_info = []
+    for job_id, job_data in processing_queue.items():
+        queue_time = time.time() - job_data["start_time"]
+        queue_info.append({
+            "job_id": job_id,
+            "file_path": job_data["file_path"],
+            "target_language": job_data["target_language"],
+            "queue_time_seconds": queue_time,
+            "status": job_data["status"]
+        })
+    
+    completed_info = []
+    for job_id, job_data in completed_jobs.items():
+        completed_info.append({
+            "job_id": job_id,
+            "status": job_data["status"],
+            "processing_time": job_data.get("processing_time", 0)
+        })
+    
+    return {
+        "queued_jobs": queue_info,
+        "completed_jobs": completed_info,
+        "queue_length": len(processing_queue),
+        "completed_count": len(completed_jobs)
+    }
+
+@app.get("/debug-info")
+async def debug_info():
+    """Get detailed debug information"""
+    logger.info("Debug info requested")
+    
+    # Check for temp files
+    temp_dir = tempfile.gettempdir()
+    temp_files = []
+    try:
+        for f in os.listdir(temp_dir):
+            if f.endswith('.wav'):
+                file_path = os.path.join(temp_dir, f)
+                temp_files.append({
+                    "file": f,
+                    "size": os.path.getsize(file_path),
+                    "mtime": os.path.getmtime(file_path)
+                })
+    except Exception as e:
+        logger.error(f"Error checking temp files: {str(e)}")
+    
+    # System info
+    sys_info = {
+        "hostname": platform.node(),
+        "platform": platform.platform(),
+        "python": sys.version,
+        "pid": os.getpid(),
+        "memory_info": {"Not available": "Use docker stats to check memory usage"},
+        "temp_dir": temp_dir,
+        "temp_wav_files": temp_files,
+        "cwd": os.getcwd(),
+        "env": {k: v for k, v in os.environ.items() if not k.lower().contains("key") and not k.lower().contains("secret") and not k.lower().contains("token")}
+    }
+    
+    # Process info
+    import psutil
+    try:
+        process = psutil.Process(os.getpid())
+        process_info = {
+            "cpu_percent": process.cpu_percent(),
+            "memory_info": str(process.memory_info()),
+            "create_time": process.create_time(),
+            "status": process.status(),
+            "threads": len(process.threads())
+        }
+    except Exception as e:
+        process_info = {"error": str(e)}
+    
+    return {
+        "system_info": sys_info,
+        "process_info": process_info,
+        "model_info": {
+            "model_loaded": model is not None,
+            "processor_loaded": processor is not None,
+            "model_loading_lock": model_loading_lock,
+            "device": DEVICE,
+            "model_id": MODEL_ID
+        },
+        "queue_info": {
+            "processing_queue_size": len(processing_queue),
+            "completed_jobs_size": len(completed_jobs)
+        }
     }
 
 @app.get("/")
 async def root():
     """API information"""
+    logger.info("Root endpoint accessed")
     return {
         "name": "Seamless M4T API",
         "version": "1.0.0",
@@ -501,7 +725,9 @@ async def root():
             {"path": "/transcribe", "method": "POST", "description": "Transcribe audio to text"},
             {"path": "/status/{job_id}", "method": "GET", "description": "Check job status"},
             {"path": "/batch", "method": "POST", "description": "Batch process multiple files"},
-            {"path": "/health", "method": "GET", "description": "Health check"}
+            {"path": "/health", "method": "GET", "description": "Health check"},
+            {"path": "/queue-status", "method": "GET", "description": "View all jobs in queue"},
+            {"path": "/debug-info", "method": "GET", "description": "Get detailed debug information"}
         ]
     }
 
@@ -509,4 +735,5 @@ async def root():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     workers = int(os.getenv("WORKERS", "1"))
+    logger.info(f"Starting uvicorn server on port {port} with {workers} workers")
     uvicorn.run("app:app", host="0.0.0.0", port=port, workers=workers)

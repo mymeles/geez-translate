@@ -17,6 +17,8 @@ services:
       - LOAD_MODEL_ON_STARTUP=true
       - TRANSFORMERS_CACHE=/home/appuser/.cache/huggingface
       - HF_HOME=/home/appuser/.cache/huggingface
+      - LOG_LEVEL=DEBUG
+      - PYTHONUNBUFFERED=1
     volumes:
       - huggingface_cache:/home/appuser/.cache/huggingface
     # GPU configuration

@@ -6,7 +6,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     DEBIAN_FRONTEND=noninteractive \
     TZ=UTC \
     TRANSFORMERS_CACHE=/home/appuser/.cache/huggingface \
-    HF_HOME=/home/appuser/.cache/huggingface
+    HF_HOME=/home/appuser/.cache/huggingface \
+    LOG_LEVEL=DEBUG
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -43,6 +44,10 @@ RUN mkdir -p /home/appuser/.cache/huggingface && \
 COPY app.py .
 COPY scripts ./scripts/
 
+# Copy startup script
+COPY start-api.sh .
+RUN chmod +x start-api.sh
+
 # Set proper permissions
 RUN chown -R appuser:appuser /app
 
@@ -57,9 +62,4 @@ HEALTHCHECK --interval=30s --timeout=60s --start-period=60s --retries=5 \
     CMD curl -f http://localhost:8000/health || exit 1
 
 # Command to run the application with proper workers
-CMD gunicorn app:app \
-    --bind 0.0.0.0:8000 \
-    --workers ${WORKERS:-1} \
-    --worker-class uvicorn.workers.UvicornWorker \
-    --timeout 300 \
-    --log-level info
+CMD ["./start-api.sh"]
