@@ -1,0 +1,42 @@
+version: '3.8'
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: always
+    ports:
+      - "8000:8000"
+    environment:
+      - PORT=8000
+      - WORKERS=4  # Adjust based on your CPU cores
+      - BATCH_SIZE=8
+      - MAX_AUDIO_LENGTH=300
+      - MODEL_PATH=facebook/seamless-m4t-v2-large  # Using the Huggingface model ID directly
+      - LOAD_MODEL_ON_STARTUP=true
+    volumes:
+      - ./models/cache:/home/appuser/.cache/huggingface
+    # Uncomment for NVIDIA GPU support
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  # Optional Nginx reverse proxy
+  # Uncomment if you want to use Nginx as a reverse proxy
+  nginx:
+    image: nginx:latest
+    restart: always
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - api
+
+volumes:
+  huggingface_cache:
