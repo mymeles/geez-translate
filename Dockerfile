@@ -18,8 +18,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libsndfile1 \
     ffmpeg \
     && rm -rf /var/lib/apt/lists/* \
-    && update-ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+    && update-ca-certificates
 
 # Update pip
 RUN pip install --upgrade pip
@@ -36,7 +35,7 @@ COPY requirements.txt .
 # Install dependencies from requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Create cache directory for huggingface
+# Create and properly permission the cache directory for Hugging Face
 RUN mkdir -p /home/appuser/.cache/huggingface && \
     chown -R appuser:appuser /home/appuser/.cache
 
@@ -53,12 +52,11 @@ USER appuser
 # Expose the port
 EXPOSE 8000
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=30s --start-period=5s --retries=3 \
+# Health check - increased timeout for model loading
+HEALTHCHECK --interval=30s --timeout=60s --start-period=60s --retries=5 \
     CMD curl -f http://localhost:8000/health || exit 1
 
-# Command to run the application
-# We'll use the number of workers based on environment variable with default of 1
+# Command to run the application with proper workers
 CMD gunicorn app:app \
     --bind 0.0.0.0:8000 \
     --workers ${WORKERS:-1} \

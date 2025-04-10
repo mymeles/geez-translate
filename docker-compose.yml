@@ -10,14 +10,16 @@ services:
       - "8000:8000"
     environment:
       - PORT=8000
-      - WORKERS=4  # Adjust based on your CPU cores
-      - BATCH_SIZE=8
+      - WORKERS=2  # Adjusted for better GPU utilization
+      - BATCH_SIZE=16  # Increased for 16GB GPU
       - MAX_AUDIO_LENGTH=300
-      - MODEL_PATH=facebook/seamless-m4t-v2-large  # Using the Huggingface model ID directly
+      - MODEL_PATH=facebook/seamless-m4t-v2-large
       - LOAD_MODEL_ON_STARTUP=true
+      - TRANSFORMERS_CACHE=/home/appuser/.cache/huggingface
+      - HF_HOME=/home/appuser/.cache/huggingface
     volumes:
-      - ./models/cache:/home/appuser/.cache/huggingface
-    # Uncomment for NVIDIA GPU support
+      - huggingface_cache:/home/appuser/.cache/huggingface
+    # GPU configuration
     deploy:
       resources:
         reservations:
@@ -25,9 +27,14 @@ services:
             - driver: nvidia
               count: 1
               capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 60s  # Increased timeout for model loading
+      retries: 5
+      start_period: 60s  # Give more time for initial model loading
 
   # Optional Nginx reverse proxy
-  # Uncomment if you want to use Nginx as a reverse proxy
   nginx:
     image: nginx:latest
     restart: always
@@ -40,3 +47,4 @@ services:
 
 volumes:
   huggingface_cache:
+    # Named volume for persistent storage

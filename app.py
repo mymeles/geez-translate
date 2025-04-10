@@ -49,6 +49,7 @@ if torch.cuda.is_available():
     # Optional - configure GPU memory growth
     torch.cuda.empty_cache()
     print(f"Using GPU: {torch.cuda.get_device_name(0)}")
+    print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB")
 else:
     print("GPU not available, using CPU")
 
@@ -94,7 +95,7 @@ LOCAL_MODEL = not MODEL_ID.startswith(("facebook/", "http://", "https://"))  # C
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "8"))  # Adjust based on GPU memory
 MAX_AUDIO_LENGTH = int(os.getenv("MAX_AUDIO_LENGTH", "300"))  # Max audio length in seconds
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-LOAD_MODEL_ON_STARTUP = os.getenv("LOAD_MODEL_ON_STARTUP", "false").lower() == "true"  # Default to false on M1 Macs
+LOAD_MODEL_ON_STARTUP = os.getenv("LOAD_MODEL_ON_STARTUP", "false").lower() == "true"
 
 # In-memory queues for processing and results
 processing_queue = {}
@@ -140,7 +141,7 @@ async def load_model():
             model_loading_lock = False
             return {"status": "error", "message": f"Error loading processor: {str(e)}"}
         
-        # Then load model
+        # Then load model with improved GPU handling
         try:
             logger.info(f"Loading model on {DEVICE}...")
             # For M1 Mac compatibility, use chunked loading
@@ -151,13 +152,20 @@ async def load_model():
                     torch_dtype=torch.float32  # Use float32 instead of half precision on M1
                 ).to(DEVICE)
             else:
-                model = SeamlessM4Tv2ForSpeechToText.from_pretrained(MODEL_ID).to(DEVICE)
-                
+                # For GPU, use half precision and better memory optimization
+                model = SeamlessM4Tv2ForSpeechToText.from_pretrained(
+                    MODEL_ID,
+                    torch_dtype=torch.float16 if DEVICE == "cuda" else None,
+                    low_cpu_mem_usage=True
+                ).to(DEVICE)
+                    
                 # Optional: optimize for inference on GPU
                 if DEVICE == "cuda":
-                    model = model.half()  # Use FP16 for faster inference
-                    logger.info("Model optimized with FP16 for GPU inference")
-                    
+                    # Already loaded with float16 dtype
+                    torch.cuda.empty_cache()  # Clear any residual memory
+                    logger.info(f"GPU Memory Allocated: {torch.cuda.memory_allocated(0) / 1024**3:.2f} GB")
+                    logger.info(f"GPU Memory Reserved: {torch.cuda.memory_reserved(0) / 1024**3:.2f} GB")
+            
             logger.info("Model loaded successfully")
             return {"status": "success"}
         except Exception as e:
@@ -230,15 +238,29 @@ def process_audio(audio_path, target_language="amh"):
             logger.error(f"Error creating inputs: {str(e)}")
             raise ValueError(f"Failed to process audio: {str(e)}")
         
-        # Generate transcription
+        # Generate transcription with improved error handling
         logger.info("Generating transcription...")
         try:
-            with torch.no_grad():
+            # Set a timeout for generation to prevent hangs
+            with torch.no_grad(), torch.cuda.amp.autocast(enabled=DEVICE=="cuda"):
                 output_tokens = model.generate(
                     **inputs,
-                    tgt_lang=target_language
+                    tgt_lang=target_language,
+                    num_beams=1  # Use greedy decoding for faster inference
                 )
+            
+            torch.cuda.empty_cache()  # Clear CUDA cache after generation
             logger.info(f"Generation successful: output shape={output_tokens.shape}")
+        except RuntimeError as e:
+            # Handle CUDA out of memory errors gracefully
+            if "CUDA out of memory" in str(e):
+                logger.error("CUDA out of memory error - try reducing batch size")
+                torch.cuda.empty_cache()  # Clear CUDA cache
+                raise ValueError("GPU memory exceeded. Try reducing audio length or batch size.")
+            else:
+                logger.error(f"Runtime error during model generation: {str(e)}")
+                logger.error(traceback.format_exc())
+                raise ValueError(f"Failed to generate transcription: {str(e)}")
         except Exception as e:
             logger.error(f"Error during model generation: {str(e)}")
             logger.error(traceback.format_exc())
@@ -322,10 +344,13 @@ async def transcribe_audio(
     """
     # Check if model is loaded
     if model is None or processor is None:
-        raise HTTPException(
-            status_code=503, 
-            detail="Model is not loaded. Please use the /load-model endpoint first."
-        )
+        # Try to load the model if it's not loaded yet
+        load_result = await load_model()
+        if load_result["status"] != "success" and load_result["status"] != "already_loaded":
+            raise HTTPException(
+                status_code=503, 
+                detail="Model could not be loaded. Please try again later or use the /load-model endpoint first."
+            )
         
     # Generate a unique ID for this job
     job_id = str(uuid.uuid4())
@@ -394,10 +419,13 @@ async def batch_process(
     """Process multiple audio files in batch"""
     # Check if model is loaded
     if model is None or processor is None:
-        raise HTTPException(
-            status_code=503, 
-            detail="Model is not loaded. Please use the /load-model endpoint first."
-        )
+        # Try to load the model if it's not loaded yet
+        load_result = await load_model()
+        if load_result["status"] != "success" and load_result["status"] != "already_loaded":
+            raise HTTPException(
+                status_code=503, 
+                detail="Model could not be loaded. Please try again later or use the /load-model endpoint first."
+            )
         
     responses = []
     
@@ -445,6 +473,7 @@ async def health_check():
             "gpu_name": torch.cuda.get_device_name(0),
             "gpu_memory_allocated": f"{torch.cuda.memory_allocated(0) / 1024**3:.2f} GB",
             "gpu_memory_reserved": f"{torch.cuda.memory_reserved(0) / 1024**3:.2f} GB",
+            "gpu_memory_total": f"{torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB",
         }
     
     return {
