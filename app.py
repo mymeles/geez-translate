@@ -409,14 +409,18 @@ async def process_audio_task(file_path, job_id, target_language):
             "error": f"Task execution failed: {str(e)}"
         }
     finally:
-        # Clean up temp file
+        # Clean up temp file ONLY if processing was successful
         try:
-            if os.path.exists(file_path):
-                logger.info(f"Removing temporary file {file_path}")
-                os.remove(file_path)
-                logger.info(f"Temporary file {file_path} removed")
+            if job_id in completed_jobs and completed_jobs[job_id]["status"] != "error":
+                if os.path.exists(file_path):
+                    logger.info(f"Removing temporary file {file_path}")
+                    os.remove(file_path)
+                    logger.info(f"Temporary file {file_path} removed")
+            else:
+                if os.path.exists(file_path):
+                     logger.warning(f"Processing failed for job {job_id}. Keeping temporary file for inspection: {file_path}")
         except Exception as e:
-            logger.warning(f"Failed to remove temporary file {file_path}: {str(e)}")
+            logger.warning(f"Error during temporary file cleanup for {file_path}: {str(e)}")
         
         # Remove from processing queue
         if job_id in processing_queue:
@@ -424,7 +428,7 @@ async def process_audio_task(file_path, job_id, target_language):
             del processing_queue[job_id]
             logger.info(f"Job {job_id} removed from processing queue")
         
-        logger.info(f"--- BACKGROUND TASK COMPLETED ---")
+        logger.info(f"--- BACKGROUND TASK COMPLETED FOR JOB {job_id} --- ({time.time() - task_start_time:.2f}s total task time)")
 
 # API Endpoints
 @app.post("/load-model")
@@ -467,9 +471,21 @@ async def transcribe_audio(
     job_id = str(uuid.uuid4())
     logger.info(f"Generated job ID: {job_id}")
     
-    # Save the uploaded file temporarily
-    logger.info(f"Saving uploaded file to temp location")
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_file:
+    # --- Get original file extension ---
+    original_filename = file.filename
+    file_extension = ""
+    if original_filename and '.' in original_filename:
+        file_extension = os.path.splitext(original_filename)[1].lower()
+    # Use a default if no extension or unknown
+    if not file_extension:
+        file_extension = ".tmpaudio" # Use a generic suffix if unknown
+    logger.info(f"Original filename: {original_filename}, Using suffix: {file_extension}")
+    # -------------------------------------
+
+    # Save the uploaded file temporarily using the original extension
+    logger.info(f"Saving uploaded file to temp location with suffix {file_extension}")
+    # Note: delete=False is important so the background task can access it
+    with tempfile.NamedTemporaryFile(delete=False, suffix=file_extension) as temp_file:
         logger.info(f"Created temp file: {temp_file.name}")
         content = await file.read()
         logger.info(f"Read {len(content)} bytes from uploaded file")

@@ -24,6 +24,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
+# Verify ffmpeg installation
+RUN ffmpeg -version
+
 # Update pip
 RUN pip install --upgrade pip
 
