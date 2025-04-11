@@ -107,7 +107,7 @@ fi
 
 # Build and start containers
 echo "Building and starting containers for ${MODEL_SIZE} model..."
-docker-compose build && docker-compose up -d
+docker compose build && docker compose up -d
 
 echo ""
 echo "✓ Geez Translate API is now running with ${MODEL_SIZE} model!"
