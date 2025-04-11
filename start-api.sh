@@ -4,6 +4,8 @@
 # Set environment variables for logging
 export LOG_LEVEL=${LOG_LEVEL:-DEBUG}
 export PYTHONUNBUFFERED=1 
+# Fix for CUDA in multiprocessing
+export PYTHONPATH=${PYTHONPATH}:.
 
 # Print diagnostic information
 echo "===== Starting Geez Translate API Service ====="
@@ -39,7 +41,10 @@ else
   echo "Running in CPU mode"
 fi
 
-# Start Gunicorn with proper logging configuration
+# Create a directory for the models if it doesn't exist
+mkdir -p /app/models/seamless-m4t-v2-medium
+
+# Start Gunicorn with proper logging configuration and CUDA fix
 echo "Starting Gunicorn with ${WORKERS:-1} workers..."
 exec gunicorn app:app \
     --bind 0.0.0.0:${PORT:-8000} \
@@ -50,5 +55,7 @@ exec gunicorn app:app \
     --access-logfile - \
     --error-logfile - \
     --capture-output \
+    --worker-tmp-dir /dev/shm \
     --preload \
-    --enable-stdio-inheritance
+    --enable-stdio-inheritance \
+    --worker-init-fn="app:_mp_fn" # Initialize worker with spawn method

@@ -1,0 +1,12 @@
+for this project all the files are in a directory called geez-translate/
+
+I am building an api endpoint for the facebook asr speech to text model to convert amharic speech into text.
+
+It uses fast api to build the api to accept high requests from the users. The goal is to use gpu cuda compatible to load the model 
+and make the infererance. 
+
+Logging each request and steps right now is import since it is in development mode. 
+
+Using docker containers to package the application and deploy it in google cloud VMs. 
+
+Current the way I am deploying is I push all my code to github and do a git pull and run the commands mannually. 

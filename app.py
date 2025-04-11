@@ -13,6 +13,42 @@ from starlette.responses import Response
 
 # Import numpy first and set environment variable to prevent _ARRAY_API error on M1 Macs
 os.environ["NUMPY_EXPERIMENTAL_ARRAY_FUNCTION"] = "0"
+
+# Set multiprocessing start method to 'spawn' for CUDA compatibility
+import multiprocessing
+
+# Initialize multiprocessing method at module level
+try:
+    multiprocessing.set_start_method('spawn')
+except RuntimeError:
+    pass  # Already set
+
+# Define a worker initialization function for Gunicorn
+def _mp_fn(server=None):
+    # Set multiprocessing start method to 'spawn' for CUDA compatibility
+    try:
+        multiprocessing.set_start_method('spawn')
+        logger.info("Set multiprocessing start method to 'spawn' for CUDA compatibility")
+    except RuntimeError:
+        logger.info("Multiprocessing start method already set or couldn't be changed")
+    
+    # Initialize CUDA in the worker process if available
+    if torch.cuda.is_available():
+        try:
+            # Initialize CUDA context for this worker
+            torch.cuda.init()
+            device_count = torch.cuda.device_count()
+            device_name = torch.cuda.get_device_name(0)
+            logger.info(f"Worker initialized with CUDA: {device_count} device(s), using {device_name}")
+            # Empty cache to start clean
+            torch.cuda.empty_cache()
+        except Exception as e:
+            logger.error(f"Error initializing CUDA in worker: {str(e)}")
+
+# Use spawn method for main process when run directly
+if __name__ == "__main__":
+    multiprocessing.set_start_method('spawn', force=True)
+
 try:
     import numpy as np
 except ImportError:
@@ -208,7 +244,24 @@ async def load_model():
         # Load processor first
         try:
             logger.info("Loading processor...")
-            processor = AutoProcessor.from_pretrained(MODEL_ID)
+            # Handle local model loading properly
+            if LOCAL_MODEL:
+                logger.info(f"Loading processor from local path: {MODEL_ID}")
+                # For local models, we need to load the processor from the local path
+                # Check if there's a processor config or model files
+                processor_config_path = os.path.join(MODEL_ID, "processor_config.json")
+                if os.path.exists(processor_config_path):
+                    logger.info(f"Found processor config at {processor_config_path}")
+                    processor = AutoProcessor.from_pretrained(MODEL_ID, local_files_only=True)
+                else:
+                    # Try the facebook model ID as fallback
+                    logger.warning(f"No processor config found at {processor_config_path}, using facebook/seamless-m4t-v2-medium")
+                    processor = AutoProcessor.from_pretrained("facebook/seamless-m4t-v2-medium")
+                    # Save the processor to the local path for future use
+                    processor.save_pretrained(MODEL_ID)
+                    logger.info(f"Saved processor to {MODEL_ID} for future use")
+            else:
+                processor = AutoProcessor.from_pretrained(MODEL_ID)
             logger.info("Processor loaded successfully")
         except Exception as e:
             logger.error(f"Error loading processor: {str(e)}")
@@ -222,19 +275,50 @@ async def load_model():
             # For M1 Mac compatibility, use chunked loading
             if "arm64" in platform.machine().lower() and DEVICE == "cpu":
                 logger.info("Detected ARM64 platform, using float32 precision")
-                model = SeamlessM4Tv2ForSpeechToText.from_pretrained(
-                    MODEL_ID, 
-                    low_cpu_mem_usage=True,
-                    torch_dtype=torch.float32  # Use float32 instead of half precision on M1
-                ).to(DEVICE)
+                if LOCAL_MODEL:
+                    model = SeamlessM4Tv2ForSpeechToText.from_pretrained(
+                        MODEL_ID,
+                        low_cpu_mem_usage=True,
+                        torch_dtype=torch.float32,  # Use float32 instead of half precision on M1
+                        local_files_only=True
+                    ).to(DEVICE)
+                else:
+                    model = SeamlessM4Tv2ForSpeechToText.from_pretrained(
+                        MODEL_ID, 
+                        low_cpu_mem_usage=True,
+                        torch_dtype=torch.float32  # Use float32 instead of half precision on M1
+                    ).to(DEVICE)
             else:
                 # For GPU, use half precision and better memory optimization
                 logger.info("Using GPU optimization with float16 precision")
-                model = SeamlessM4Tv2ForSpeechToText.from_pretrained(
-                    MODEL_ID,
-                    torch_dtype=torch.float16 if DEVICE == "cuda" else None,
-                    low_cpu_mem_usage=True
-                ).to(DEVICE)
+                if LOCAL_MODEL:
+                    # Handle the case where a locally saved model might not exist yet
+                    model_config_path = os.path.join(MODEL_ID, "config.json")
+                    if os.path.exists(model_config_path):
+                        logger.info(f"Loading model from local path: {MODEL_ID}")
+                        model = SeamlessM4Tv2ForSpeechToText.from_pretrained(
+                            MODEL_ID,
+                            torch_dtype=torch.float16 if DEVICE == "cuda" else None,
+                            low_cpu_mem_usage=True,
+                            local_files_only=True
+                        ).to(DEVICE)
+                    else:
+                        # Try the facebook model ID as fallback
+                        logger.warning(f"No model config found at {model_config_path}, using facebook/seamless-m4t-v2-medium")
+                        model = SeamlessM4Tv2ForSpeechToText.from_pretrained(
+                            "facebook/seamless-m4t-v2-medium",
+                            torch_dtype=torch.float16 if DEVICE == "cuda" else None,
+                            low_cpu_mem_usage=True
+                        ).to(DEVICE)
+                        # Save the model to the local path for future use
+                        model.save_pretrained(MODEL_ID)
+                        logger.info(f"Saved model to {MODEL_ID} for future use")
+                else:
+                    model = SeamlessM4Tv2ForSpeechToText.from_pretrained(
+                        MODEL_ID,
+                        torch_dtype=torch.float16 if DEVICE == "cuda" else None,
+                        low_cpu_mem_usage=True
+                    ).to(DEVICE)
                     
                 # Apply INT8 quantization if enabled (on supported GPUs)
                 if USE_QUANTIZATION and DEVICE == "cuda":

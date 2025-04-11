@@ -5,28 +5,37 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        - MODEL_SIZE=${MODEL_SIZE:-large}  # Default to large if not specified
     restart: always
     ports:
       - "8000:8000"
     environment:
       - PORT=8000
       - WORKERS=1  # Single worker for better GPU utilization
-      - BATCH_SIZE=16  # Optimized for L4 GPU
+      - BATCH_SIZE=${BATCH_SIZE:-16}  # Optimized for L4 GPU
       - MAX_AUDIO_LENGTH=300
-      # Use the local model path inside the container
-      - MODEL_PATH=/app/models/seamless-m4t-v2-medium
+      # Use the local model path inside the container with dynamic model size
+      - MODEL_SIZE=${MODEL_SIZE:-large}
+      - MODEL_PATH=/app/models/seamless-m4t-v2-${MODEL_SIZE:-large}
       - LOAD_MODEL_ON_STARTUP=true
       - TRANSFORMERS_CACHE=/home/appuser/.cache/huggingface
       - HF_HOME=/home/appuser/.cache/huggingface
-      - LOG_LEVEL=INFO  # Changed from DEBUG to reduce logging overhead
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - PYTHONUNBUFFERED=1
+      # Fix for CUDA multiprocessing
+      - PYTORCH_MULTIPROCESSING_START_METHOD=spawn
+      # Fix for transformer auto-detection of local models
+      - TRANSFORMERS_OFFLINE=1
       # Optimization environment variables
-      - USE_QUANTIZATION=true
-      - USE_TORCH_COMPILE=true
-      - CHUNK_SIZE=5
-      - CHUNK_OVERLAP=0.5
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-true}
+      - USE_TORCH_COMPILE=${USE_TORCH_COMPILE:-true}
+      - CHUNK_SIZE=${CHUNK_SIZE:-5}
+      - CHUNK_OVERLAP=${CHUNK_OVERLAP:-0.5}
     volumes:
       - huggingface_cache:/home/appuser/.cache/huggingface
+      # Mount local model directory 
+      - ./models:/app/models
     # GPU configuration
     deploy:
       resources:
@@ -35,12 +44,17 @@ services:
             - driver: nvidia
               count: 1
               capabilities: [gpu]
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
-      interval: 30s
-      timeout: 60s  # Increased timeout for model loading
-      retries: 5
-      start_period: 60s  # Give more time for initial model loading
+    command: >
+      gunicorn app:app 
+      --bind 0.0.0.0:8000 
+      --workers 1 
+      --worker-class uvicorn.workers.UvicornWorker 
+      --timeout 300 
+      --log-level ${LOG_LEVEL:-info}
+      --access-logfile - 
+      --error-logfile - 
+      --worker-tmp-dir /dev/shm 
+      --preload
 
   # Optional Nginx reverse proxy with enhanced caching
   nginx:

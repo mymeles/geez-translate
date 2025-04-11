@@ -1,5 +1,8 @@
 FROM nvcr.io/nvidia/pytorch:23.07-py3
 
+# Build arguments
+ARG MODEL_SIZE=large  # Default to large if not specified
+
 # Set environment variables
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -8,11 +11,16 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     TRANSFORMERS_CACHE=/app/models/cache \
     HF_HOME=/app/models/cache \
     LOG_LEVEL=INFO \
+    MODEL_SIZE=${MODEL_SIZE} \
     # Optimized Torch environment settings
     TORCH_CUDNN_V8_API_ENABLED=1 \
     CUDA_MODULE_LOADING=LAZY \
     # Enable PyTorch optimizations
-    PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128
+    PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128 \
+    # Force CUDA to use spawn for multiprocessing
+    PYTORCH_MULTIPROCESSING_START_METHOD=spawn \
+    # Force transformers to use local files
+    TRANSFORMERS_OFFLINE=1
 
 # Install system dependencies and clean up in one layer
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -41,8 +49,9 @@ RUN useradd -m -u 1000 appuser
 WORKDIR /app
 RUN chown -R appuser:appuser /app
 
-# Create model cache directory
+# Create model cache directory and model directory structure based on MODEL_SIZE
 RUN mkdir -p /app/models/cache && \
+    mkdir -p /app/models/seamless-m4t-v2-${MODEL_SIZE} && \
     chown -R appuser:appuser /app/models
 
 # Copy requirements first for better layer caching
@@ -61,11 +70,16 @@ RUN pip install --user -r requirements.txt && \
     pip install --user numba && \
     pip install --user psutil
 
+# Preload is disabled by default as we're mounting the model from host
+# Uncomment and adapt the following code if you want to preload the model
+# RUN python -c "from transformers import AutoProcessor, SeamlessM4Tv2ForSpeechToText; \
+#     processor = AutoProcessor.from_pretrained('facebook/seamless-m4t-v2-${MODEL_SIZE}'); \
+#     processor.save_pretrained('/app/models/seamless-m4t-v2-${MODEL_SIZE}'); \
+#     print('Processor saved successfully');"
+
 # Copy application code
 USER root
 COPY app.py .
-# Only copy scripts if they are actually used by app.py
-# COPY scripts ./scripts/
 
 # Set proper permissions for the app directory
 RUN chown -R appuser:appuser /app
@@ -79,18 +93,8 @@ ENV PATH="/home/appuser/.local/bin:${PATH}"
 # Expose the port
 EXPOSE 8000
 
-# Health check - increased timeout for model loading
+# Health check
 HEALTHCHECK --interval=30s --timeout=60s --start-period=60s --retries=5 \
     CMD curl -f http://localhost:8000/health || exit 1
 
-# Command to run the application with Gunicorn optimized for ML workloads
-CMD gunicorn app:app \
-    --bind 0.0.0.0:8000 \
-    --workers ${WORKERS:-1} \
-    --worker-class uvicorn.workers.UvicornWorker \
-    --timeout 300 \
-    --log-level info \
-    --access-logfile - \
-    --error-logfile - \
-    --worker-tmp-dir /dev/shm \
-    --preload
+# No default command - will be provided by docker-compose
