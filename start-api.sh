@@ -50,4 +50,5 @@ exec gunicorn app:app \
     --access-logfile - \
     --error-logfile - \
     --capture-output \
+    --preload \
     --enable-stdio-inheritance

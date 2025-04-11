@@ -9,7 +9,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     HF_HOME=/home/appuser/.cache/huggingface \
     LOG_LEVEL=DEBUG
 
-# Install system dependencies
+# Install system dependencies and clean up in one layer
 RUN apt-get update && apt-get install -y --no-install-recommends \
     wget \
     git \
@@ -18,8 +18,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     libsndfile1 \
     ffmpeg \
-    && rm -rf /var/lib/apt/lists/* \
-    && update-ca-certificates
+    # Update certificates
+    && update-ca-certificates \
+    # Clean up
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
 
 # Update pip
 RUN pip install --upgrade pip
@@ -34,21 +37,20 @@ WORKDIR /app
 COPY requirements.txt .
 
 # Install dependencies from requirements.txt
+# Consider adding --require-hashes if you have a locked requirements file
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Create and properly permission the cache directory for Hugging Face
+# Ensure the parent directory exists and has correct permissions first if needed
 RUN mkdir -p /home/appuser/.cache/huggingface && \
     chown -R appuser:appuser /home/appuser/.cache
 
 # Copy application code
 COPY app.py .
-COPY scripts ./scripts/
+# Only copy scripts if they are actually used by app.py
+# COPY scripts ./scripts/
 
-# Copy startup script
-COPY start-api.sh .
-RUN chmod +x start-api.sh
-
-# Set proper permissions
+# Set proper permissions for the app directory
 RUN chown -R appuser:appuser /app
 
 # Switch to non-root user
@@ -61,5 +63,12 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=60s --start-period=60s --retries=5 \
     CMD curl -f http://localhost:8000/health || exit 1
 
-# Command to run the application with proper workers
-CMD ["./start-api.sh"]
+# Command to run the application with Gunicorn
+CMD gunicorn app:app \
+    --bind 0.0.0.0:8000 \
+    --workers ${WORKERS:-1} \
+    --worker-class uvicorn.workers.UvicornWorker \
+    --timeout 300 \
+    --log-level info \
+    --access-logfile - \
+    --error-logfile -

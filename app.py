@@ -6,6 +6,10 @@ from typing import Optional, List
 import sys
 import platform
 import traceback
+import logging
+from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
+from starlette.requests import Request
+from starlette.responses import Response
 
 # Import numpy first and set environment variable to prevent _ARRAY_API error on M1 Macs
 os.environ["NUMPY_EXPERIMENTAL_ARRAY_FUNCTION"] = "0"
@@ -31,7 +35,6 @@ from fastapi import FastAPI, File, UploadFile, BackgroundTasks, HTTPException, F
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-import logging
 import traceback
 
 # Enhanced logging configuration
@@ -68,7 +71,34 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# Enable CORS
+# Middleware for logging requests
+class LoggingMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
+        start_time = time.time()
+        logger.info(f"Request received: {request.method} {request.url.path}")
+        
+        # Log headers if needed (be careful with sensitive info)
+        # logger.debug(f"Request headers: {dict(request.headers)}")
+        
+        try:
+            response = await call_next(request)
+            process_time = time.time() - start_time
+            logger.info(f"Request completed: {request.method} {request.url.path} - Status: {response.status_code} - Took: {process_time:.4f}s")
+            
+            # Log response headers if needed
+            # logger.debug(f"Response headers: {dict(response.headers)}")
+            
+            return response
+        except Exception as e:
+            logger.error(f"Request failed: {request.method} {request.url.path} - Error: {str(e)}")
+            logger.error(traceback.format_exc())
+            # Re-raise the exception to let FastAPI handle it
+            raise e
+
+# Add the logging middleware *early* in the middleware stack
+app.add_middleware(LoggingMiddleware)
+
+# Enable CORS *after* the logging middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # Modify in production
