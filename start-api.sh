@@ -56,6 +56,5 @@ exec gunicorn app:app \
     --error-logfile - \
     --capture-output \
     --worker-tmp-dir /dev/shm \
-    --preload \
     --enable-stdio-inheritance \
     --worker-init-fn="app:_mp_fn" # Initialize worker with spawn method

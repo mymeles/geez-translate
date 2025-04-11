@@ -54,7 +54,6 @@ services:
       --access-logfile - 
       --error-logfile - 
       --worker-tmp-dir /dev/shm 
-      --preload
 
   # Optional Nginx reverse proxy with enhanced caching
   nginx:
