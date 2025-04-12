@@ -1028,55 +1028,38 @@ async def health_check():
     """Health check endpoint"""
     logger.info("Health check requested")
     
-    # Get system information
-    system_info = {
-        "python_version": sys.version,
-        "platform": f"{platform.system()} {platform.release()} ({platform.machine()})",
-        "torch_version": torch.__version__,
-        "numpy_version": np.__version__,
-    }
-    
-    gpu_info = {}
-    if torch.cuda.is_available():
-        gpu_info = {
-            "gpu_name": torch.cuda.get_device_name(0),
-            "gpu_memory_allocated": f"{torch.cuda.memory_allocated(0) / 1024**3:.2f} GB",
-            "gpu_memory_reserved": f"{torch.cuda.memory_reserved(0) / 1024**3:.2f} GB",
-            "gpu_memory_total": f"{torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB",
-            "cuda_graph_captured": model_graph_captured,
-            "using_quantization": USE_QUANTIZATION,
-            "using_torch_compile": USE_TORCH_COMPILE,
+    try:
+        # Simplified response to avoid potential errors
+        basic_health = {
+            "status": "healthy",
+            "model_loaded": model is not None,
+            "processor_loaded": processor is not None,
+            "device": DEVICE,
+            "timestamp": time.time()
         }
-    
-    response = {
-        "status": "healthy",
-        "model_loaded": model is not None,
-        "processor_loaded": processor is not None,
-        "loading_complete": model is not None and processor is not None,
-        "model_loading_in_progress": model_loading_lock,
-        "jobs_in_queue": len(processing_queue),
-        "completed_jobs": len(completed_jobs),
-        "device": DEVICE,
-        "system_info": system_info,
-        "gpu_info": gpu_info,
-        "optimization_settings": {
-            "use_quantization": USE_QUANTIZATION,
-            "use_torch_compile": USE_TORCH_COMPILE,
-            "chunk_size": CHUNK_SIZE,
-            "chunk_overlap": CHUNK_OVERLAP,
-            "batch_size": BATCH_SIZE
-        },
-        "timestamp": time.time()
-    }
-    
-    # Log queue details for debugging
-    if processing_queue:
-        logger.info(f"Current processing queue ({len(processing_queue)} jobs):")
-        for job_id, job_info in processing_queue.items():
-            queue_time = time.time() - job_info["start_time"]
-            logger.info(f"  - Job {job_id}: in queue for {queue_time:.2f}s")
-    
-    return response
+        
+        # Only add GPU info if it's available and not causing errors
+        if torch.cuda.is_available():
+            try:
+                gpu_name = torch.cuda.get_device_name(0)
+                basic_health["gpu"] = gpu_name
+            except Exception as e:
+                logger.error(f"Error getting GPU info: {str(e)}")
+                basic_health["gpu_error"] = str(e)
+        
+        logger.info(f"Health check response: {basic_health}")
+        return basic_health
+    except Exception as e:
+        # Log any unexpected errors
+        logger.error(f"CRITICAL ERROR in health endpoint: {str(e)}")
+        logger.error(traceback.format_exc())
+        
+        # Return a simplified error response
+        return {
+            "status": "error",
+            "error": str(e),
+            "timestamp": time.time()
+        }
 
 @app.get("/queue-status")
 async def queue_status():

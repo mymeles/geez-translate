@@ -94,15 +94,8 @@ services:
         echo '--------------------------------------------------------------'
         echo 'Starting API server'
         echo '--------------------------------------------------------------'
-        gunicorn app:app 
-        --bind 0.0.0.0:8000 
-        --workers 1 
-        --worker-class uvicorn.workers.UvicornWorker 
-        --timeout 300 
-        --log-level ${LOG_LEVEL:-info}
-        --access-logfile - 
-        --error-logfile - 
-        --worker-tmp-dir /dev/shm"
+        # Better configuration for uvicorn in production
+        python -m uvicorn app:app --host 0.0.0.0 --port 8000 --log-level ${LOG_LEVEL:-info} --timeout-keep-alive 75 --lifespan on"
 
   # Optional Nginx reverse proxy with enhanced caching
   nginx:
