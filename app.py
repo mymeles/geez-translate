@@ -125,17 +125,44 @@ app = FastAPI(
 class LoggingMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
         start_time = time.time()
-        logger.info(f"Request received: {request.method} {request.url.path}")
+        request_id = str(uuid.uuid4())[:8]  # Short unique ID for request tracking
+        
+        # Log request details
+        logger.info(f"[{request_id}] Request received: {request.method} {request.url.path}")
+        
+        # Log additional information for debugging
+        client_host = request.client.host if request.client else "unknown"
+        headers = dict(request.headers.items())
+        # Remove sensitive headers if any
+        if "authorization" in headers:
+            headers["authorization"] = "[REDACTED]"
+        
+        logger.info(f"[{request_id}] Client: {client_host}, Headers: {headers}")
+        
+        # For multipart uploads, log form fields and file details
+        if request.headers.get("content-type", "").startswith("multipart/form-data"):
+            logger.info(f"[{request_id}] Detected multipart/form-data upload request")
+            try:
+                # We can't consume the body yet, as it would prevent processing by the route handlers
+                logger.info(f"[{request_id}] Content-Length: {request.headers.get('content-length')}")
+            except Exception as e:
+                logger.error(f"[{request_id}] Error examining multipart request: {str(e)}")
         
         try:
+            # Process the request
             response = await call_next(request)
             process_time = time.time() - start_time
-            logger.info(f"Request completed: {request.method} {request.url.path} - Status: {response.status_code} - Took: {process_time:.4f}s")
+            
+            # Log response details
+            logger.info(f"[{request_id}] Request completed: {request.method} {request.url.path} - " 
+                        f"Status: {response.status_code} - Took: {process_time:.4f}s")
             
             return response
         except Exception as e:
-            logger.error(f"Request failed: {request.method} {request.url.path} - Error: {str(e)}")
-            logger.error(traceback.format_exc())
+            process_time = time.time() - start_time
+            logger.error(f"[{request_id}] Request failed: {request.method} {request.url.path} - " 
+                         f"Error: {str(e)} - Took: {process_time:.4f}s")
+            logger.error(f"[{request_id}] {traceback.format_exc()}")
             # Re-raise the exception to let FastAPI handle it
             raise e
 
@@ -759,13 +786,13 @@ async def process_audio_task(file_path, job_id, target_language):
     global task_start_time
     task_start_time = time.time()
     
-    logger.info(f"--- STARTING BACKGROUND TASK ---")
+    logger.info(f"===================== BACKGROUND TASK STARTED FOR JOB {job_id} =====================")
     logger.info(f"Background task for job {job_id} with file {file_path}")
     
     try:
         # Check if file exists and is readable before processing
         if not os.path.exists(file_path):
-            logger.error(f"Audio file does not exist: {file_path}")
+            logger.error(f"CRITICAL: Audio file does not exist: {file_path}")
             completed_jobs[job_id] = {
                 "id": job_id,
                 "text": "",
@@ -775,14 +802,47 @@ async def process_audio_task(file_path, job_id, target_language):
             }
             return
         
+        # Get file information
+        file_size = os.path.getsize(file_path)
+        file_permissions = oct(os.stat(file_path).st_mode)
+        logger.info(f"File details: Size={file_size} bytes, Permissions={file_permissions}")
+        
+        # Check if file is accessible
+        if not os.access(file_path, os.R_OK):
+            logger.error(f"CRITICAL: Cannot read audio file (permission denied): {file_path}")
+            completed_jobs[job_id] = {
+                "id": job_id,
+                "text": "",
+                "processing_time": 0,
+                "status": "error",
+                "error": f"Cannot read audio file (permission denied): {file_path}"
+            }
+            return
+        
+        # Check model state in the background task
+        logger.info(f"Model state in background task - Model: {'Loaded' if model is not None else 'Not loaded'}, Processor: {'Loaded' if processor is not None else 'Not loaded'}")
+        
+        # Print GPU memory status before processing
+        if torch.cuda.is_available():
+            mem_allocated = torch.cuda.memory_allocated(0) / 1024**3
+            mem_reserved = torch.cuda.memory_reserved(0) / 1024**3
+            logger.info(f"GPU memory before processing: Allocated={mem_allocated:.2f}GB, Reserved={mem_reserved:.2f}GB")
+        
         logger.info(f"Processing audio for job {job_id}")
+        processing_start_time = time.time()
         result = process_audio(file_path, target_language)
+        processing_time = time.time() - processing_start_time
+        logger.info(f"Audio processing completed in {processing_time:.2f} seconds")
         result["id"] = job_id
         
         if result["status"] == "error":
             logger.error(f"Job {job_id} failed: {result.get('error', 'Unknown error')}")
         else:
             logger.info(f"Job {job_id} completed successfully")
+            # Log a sample of the transcription
+            transcription = result.get("text", "")
+            transcription_sample = transcription[:100] + "..." if len(transcription) > 100 else transcription
+            logger.info(f"Transcription sample: {transcription_sample}")
         
         # Store the result
         logger.info(f"Storing result for job {job_id}")
@@ -790,7 +850,7 @@ async def process_audio_task(file_path, job_id, target_language):
         logger.info(f"Result stored for job {job_id}")
         
     except Exception as e:
-        logger.error(f"Unexpected error in process_audio_task for job {job_id}: {str(e)}")
+        logger.error(f"CRITICAL: Unexpected error in process_audio_task for job {job_id}: {str(e)}")
         logger.error(traceback.format_exc())
         completed_jobs[job_id] = {
             "id": job_id,
@@ -802,24 +862,38 @@ async def process_audio_task(file_path, job_id, target_language):
     finally:
         # Clean up temp file ONLY if processing was successful
         try:
-            if job_id in completed_jobs and completed_jobs[job_id]["status"] != "error":
-                if os.path.exists(file_path):
-                    logger.info(f"Removing temporary file {file_path}")
-                    os.remove(file_path)
-                    logger.info(f"Temporary file {file_path} removed")
+            if job_id in completed_jobs:
+                if completed_jobs[job_id]["status"] != "error":
+                    if os.path.exists(file_path):
+                        logger.info(f"Removing temporary file {file_path}")
+                        os.remove(file_path)
+                        logger.info(f"Temporary file {file_path} removed")
+                else:
+                    if os.path.exists(file_path):
+                        logger.warning(f"Processing failed for job {job_id}. Keeping temporary file for inspection: {file_path}")
             else:
-                if os.path.exists(file_path):
-                     logger.warning(f"Processing failed for job {job_id}. Keeping temporary file for inspection: {file_path}")
+                logger.warning(f"Job {job_id} not in completed_jobs, something went wrong")
         except Exception as e:
             logger.warning(f"Error during temporary file cleanup for {file_path}: {str(e)}")
+            logger.warning(traceback.format_exc())
         
         # Remove from processing queue
         if job_id in processing_queue:
             logger.info(f"Removing job {job_id} from processing queue")
             del processing_queue[job_id]
             logger.info(f"Job {job_id} removed from processing queue")
+        else:
+            logger.warning(f"Job {job_id} not found in processing queue when trying to remove it")
         
-        logger.info(f"--- BACKGROUND TASK COMPLETED FOR JOB {job_id} --- ({time.time() - task_start_time:.2f}s total task time)")
+        # Print GPU memory status after processing
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()  # Clean up GPU memory
+            mem_allocated = torch.cuda.memory_allocated(0) / 1024**3
+            mem_reserved = torch.cuda.memory_reserved(0) / 1024**3
+            logger.info(f"GPU memory after processing: Allocated={mem_allocated:.2f}GB, Reserved={mem_reserved:.2f}GB")
+        
+        logger.info(f"===================== BACKGROUND TASK COMPLETED FOR JOB {job_id} =====================")
+        logger.info(f"Total task time: {time.time() - task_start_time:.2f}s")
 
 # API Endpoints
 @app.post("/load-model")
@@ -834,6 +908,70 @@ async def load_model_endpoint():
     logger.info(f"Manual model loading result: {result}")
     return result
 
+# Debug endpoint for testing file uploads
+@app.post("/test-upload")
+async def test_upload(file: UploadFile = File(...)):
+    """Simple endpoint to test if file uploads are working properly"""
+    logger.info(f"Test upload received for file: {file.filename}")
+    
+    try:
+        # Get file info
+        content = await file.read()
+        file_size = len(content)
+        
+        # Get content type and extension
+        content_type = file.content_type or "unknown"
+        file_extension = ""
+        if file.filename and '.' in file.filename:
+            file_extension = os.path.splitext(file.filename)[1].lower()
+        
+        # Log detailed information
+        logger.info(f"Received file upload:")
+        logger.info(f"  Filename: {file.filename}")
+        logger.info(f"  Size: {file_size} bytes")
+        logger.info(f"  Content-Type: {content_type}")
+        logger.info(f"  Extension: {file_extension}")
+        
+        # Save the file temporarily to verify file system access
+        temp_dir = tempfile.gettempdir()
+        temp_path = os.path.join(temp_dir, f"test_upload_{int(time.time())}{file_extension}")
+        
+        with open(temp_path, "wb") as temp_file:
+            # Reset file pointer and write the content
+            await file.seek(0)
+            content = await file.read()
+            temp_file.write(content)
+        
+        logger.info(f"Successfully saved test file to: {temp_path}")
+        
+        # Get system file info
+        if os.path.exists(temp_path):
+            stat_info = os.stat(temp_path)
+            logger.info(f"  File saved size: {stat_info.st_size} bytes")
+            logger.info(f"  File permissions: {oct(stat_info.st_mode)}")
+            # Clean up
+            os.remove(temp_path)
+            logger.info(f"  Test file removed")
+        
+        return {
+            "status": "success",
+            "message": "File upload test successful",
+            "file_info": {
+                "filename": file.filename,
+                "size": file_size,
+                "content_type": content_type,
+                "extension": file_extension
+            }
+        }
+    except Exception as e:
+        logger.error(f"Error in test-upload endpoint: {str(e)}")
+        logger.error(traceback.format_exc())
+        return {
+            "status": "error",
+            "message": f"File upload test failed: {str(e)}",
+            "error_details": str(e)
+        }
+
 @app.post("/transcribe", response_model=QueuedResponse)
 async def transcribe_audio(
     background_tasks: BackgroundTasks,
@@ -844,75 +982,142 @@ async def transcribe_audio(
     Transcribe an audio file to text.
     Returns job ID immediately and processes in the background.
     """
-    logger.info(f"Transcribe request received for file: {file.filename}, target: {target_language}")
+    logger.info("===================== TRANSCRIBE REQUEST STARTED =====================")
+    logger.info(f"Transcribe request received - HTTP Headers: {file.headers}")
+    logger.info(f"File info - Filename: {file.filename}, Content-Type: {file.content_type}")
+    logger.info(f"Target language: {target_language}")
     
-    # Check if model is loaded
-    if model is None or processor is None:
-        logger.info("Model not loaded, attempting to load it now")
-        # Try to load the model if it's not loaded yet
-        load_result = await load_model()
-        if load_result["status"] != "success" and load_result["status"] != "already_loaded":
-            logger.error(f"Model could not be loaded: {load_result}")
-            raise HTTPException(
-                status_code=503, 
-                detail="Model could not be loaded. Please try again later or use the /load-model endpoint first."
-            )
+    try:
+        # Check if model is loaded
+        logger.info("Checking if model is loaded...")
+        if model is None or processor is None:
+            logger.info("Model not loaded, attempting to load it now")
+            # Try to load the model if it's not loaded yet
+            load_result = await load_model()
+            if load_result["status"] != "success" and load_result["status"] != "already_loaded":
+                logger.error(f"Model could not be loaded: {load_result}")
+                raise HTTPException(
+                    status_code=503, 
+                    detail="Model could not be loaded. Please try again later or use the /load-model endpoint first."
+                )
+            logger.info("Model loaded successfully")
+        else:
+            logger.info("Model already loaded")
         
-    # Generate a unique ID for this job
-    job_id = str(uuid.uuid4())
-    logger.info(f"Generated job ID: {job_id}")
-    
-    # --- Get original file extension ---
-    original_filename = file.filename
-    file_extension = ""
-    if original_filename and '.' in original_filename:
-        file_extension = os.path.splitext(original_filename)[1].lower()
-    # Use a default if no extension or unknown
-    if not file_extension:
-        file_extension = ".tmpaudio" # Use a generic suffix if unknown
-    logger.info(f"Original filename: {original_filename}, Using suffix: {file_extension}")
-    # -------------------------------------
+        # Generate a unique ID for this job
+        job_id = str(uuid.uuid4())
+        logger.info(f"Generated job ID: {job_id}")
+        
+        # --- Get original file extension ---
+        original_filename = file.filename
+        file_extension = ""
+        if original_filename and '.' in original_filename:
+            file_extension = os.path.splitext(original_filename)[1].lower()
+        # Use a default if no extension or unknown
+        if not file_extension:
+            file_extension = ".tmpaudio" # Use a generic suffix if unknown
+        logger.info(f"Original filename: {original_filename}, Using suffix: {file_extension}")
+        # -------------------------------------
 
-    # Save the uploaded file temporarily using the original extension
-    logger.info(f"Saving uploaded file to temp location with suffix {file_extension}")
-    # Note: delete=False is important so the background task can access it
-    with tempfile.NamedTemporaryFile(delete=False, suffix=file_extension) as temp_file:
-        logger.info(f"Created temp file: {temp_file.name}")
-        content = await file.read()
-        logger.info(f"Read {len(content)} bytes from uploaded file")
-        temp_file.write(content)
-        temp_file_path = temp_file.name
-    
-    logger.info(f"File saved to: {temp_file_path}")
-    
-    # Check if the file was saved correctly
-    if os.path.exists(temp_file_path):
-        file_size = os.path.getsize(temp_file_path)
-        logger.info(f"Temporary file exists, size: {file_size} bytes")
-    else:
-        logger.error(f"Temporary file was not created successfully: {temp_file_path}")
-        raise HTTPException(status_code=500, detail="Failed to save uploaded file")
-    
-    # Add to processing queue
-    logger.info(f"Adding job {job_id} to processing queue")
-    processing_queue[job_id] = {
-        "file_path": temp_file_path,
-        "target_language": target_language,
-        "start_time": time.time(),
-        "status": "queued"
-    }
-    
-    # Process in background
-    logger.info(f"Adding background task for job {job_id}")
-    background_tasks.add_task(process_audio_task, temp_file_path, job_id, target_language)
-    logger.info(f"Background task added for job {job_id}")
-    
-    # Return the job ID immediately
-    return QueuedResponse(
-        id=job_id,
-        status="processing",
-        estimated_completion_time=15.0  # Reduced estimation with optimizations
-    )
+        # Try to read file data with detailed logging
+        logger.info("Attempting to read file data...")
+        try:
+            # Read first 100 bytes to check if file is readable
+            file_preview = await file.read(100)
+            file_preview_len = len(file_preview)
+            logger.info(f"Successfully read first {file_preview_len} bytes from file")
+            
+            # Reset file position to beginning
+            await file.seek(0)
+            logger.info("File seek(0) successful")
+        except Exception as read_error:
+            logger.error(f"CRITICAL: Error reading file data: {str(read_error)}")
+            logger.error(traceback.format_exc())
+            raise HTTPException(status_code=400, detail=f"Error reading file: {str(read_error)}")
+
+        # Save the uploaded file temporarily using the original extension
+        logger.info(f"Saving uploaded file to temp location with suffix {file_extension}")
+        try:
+            # Note: delete=False is important so the background task can access it
+            with tempfile.NamedTemporaryFile(delete=False, suffix=file_extension) as temp_file:
+                logger.info(f"Created temp file: {temp_file.name}")
+                # Read the full file content
+                content = await file.read()
+                content_len = len(content)
+                logger.info(f"Read {content_len} bytes from uploaded file")
+                
+                # Write the content to the temp file
+                temp_file.write(content)
+                temp_file_path = temp_file.name
+                logger.info(f"File saved to: {temp_file_path}")
+                
+                # Verify the file was written correctly
+                temp_file.flush()
+                actual_size = os.path.getsize(temp_file_path)
+                logger.info(f"Verified file size on disk: {actual_size} bytes")
+                
+                if actual_size != content_len:
+                    logger.warning(f"WARNING: File size mismatch! Read {content_len} bytes but saved {actual_size} bytes")
+        except Exception as save_error:
+            logger.error(f"CRITICAL: Error saving file: {str(save_error)}")
+            logger.error(traceback.format_exc())
+            raise HTTPException(status_code=500, detail=f"Error saving uploaded file: {str(save_error)}")
+        
+        # Check if the file was saved correctly
+        if os.path.exists(temp_file_path):
+            file_size = os.path.getsize(temp_file_path)
+            file_permissions = oct(os.stat(temp_file_path).st_mode)
+            logger.info(f"Temporary file exists, size: {file_size} bytes, permissions: {file_permissions}")
+            
+            # Try to get file MIME type if possible
+            try:
+                import magic
+                file_mime = magic.from_file(temp_file_path, mime=True)
+                logger.info(f"File MIME type: {file_mime}")
+            except ImportError:
+                logger.info("python-magic not installed, skipping MIME type detection")
+            except Exception as e:
+                logger.warning(f"Could not detect MIME type: {str(e)}")
+        else:
+            logger.error(f"CRITICAL: Temporary file was not created successfully: {temp_file_path}")
+            raise HTTPException(status_code=500, detail="Failed to save uploaded file")
+        
+        # Add to processing queue
+        logger.info(f"Adding job {job_id} to processing queue")
+        processing_queue[job_id] = {
+            "file_path": temp_file_path,
+            "target_language": target_language,
+            "start_time": time.time(),
+            "status": "queued"
+        }
+        
+        # Process in background
+        logger.info(f"Adding background task for job {job_id}")
+        try:
+            background_tasks.add_task(process_audio_task, temp_file_path, job_id, target_language)
+            logger.info(f"Background task added for job {job_id}")
+        except Exception as task_error:
+            logger.error(f"CRITICAL: Error adding background task: {str(task_error)}")
+            logger.error(traceback.format_exc())
+            # Clean up the queue entry
+            if job_id in processing_queue:
+                del processing_queue[job_id]
+            raise HTTPException(status_code=500, detail=f"Error scheduling audio processing: {str(task_error)}")
+        
+        logger.info("===================== TRANSCRIBE REQUEST COMPLETED =====================")
+        # Return the job ID immediately
+        return QueuedResponse(
+            id=job_id,
+            status="processing",
+            estimated_completion_time=15.0  # Reduced estimation with optimizations
+        )
+    except HTTPException:
+        logger.error("Transcribe request failed with HTTPException")
+        raise
+    except Exception as e:
+        logger.error(f"CRITICAL UNHANDLED EXCEPTION in transcribe endpoint: {str(e)}")
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 @app.get("/status/{job_id}", response_model=None)  # Remove response_model to allow additional fields
 async def check_status(job_id: str, debug: bool = False):
