@@ -520,6 +520,9 @@ def load_audio(audio_path, target_sr=16000):
 
 # Helper functions
 def process_audio(audio_path, target_language="amh"):
+    # Declare intent to use global variables for CUDA graph capture
+    global model_graph_captured, cuda_graph, dummy_input
+    
     start_time = time.time()
     
     try:
