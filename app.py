@@ -211,6 +211,11 @@ USE_TORCH_COMPILE = os.getenv("USE_TORCH_COMPILE", "true").lower() == "true"
 CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "5"))  # Chunk size in seconds
 CHUNK_OVERLAP = float(os.getenv("CHUNK_OVERLAP", "0.5"))  # Chunk overlap in seconds
 
+# Store health check sample translation result
+SAMPLE_TRANSLATION = None
+SAMPLE_TRANSLATION_ERROR = None
+SAMPLE_TRANSLATION_TIME = None
+
 # Log important configuration settings
 logger.info(f"MODEL_ID: {MODEL_ID}")
 logger.info(f"LOCAL_MODEL: {LOCAL_MODEL}")
@@ -469,6 +474,13 @@ async def startup_event():
         logger.info("Loading model on startup as configured...")
         result = await load_model()
         logger.info(f"Model loading result: {result}")
+        
+        # Process a sample audio for health check
+        if result["status"] == "success" or result["status"] == "already_loaded":
+            logger.info("Processing sample audio for health check...")
+            await process_sample_audio()
+        else:
+            logger.warning("Skipping sample audio processing as model failed to load")
     else:
         logger.info("Model loading on startup disabled. Use /load-model endpoint to load it.")
     
@@ -1243,6 +1255,16 @@ async def health_check():
             "timestamp": time.time()
         }
         
+        # Add sample translation information if available
+        if SAMPLE_TRANSLATION is not None:
+            basic_health["sample_translation"] = {
+                "text": SAMPLE_TRANSLATION[:100] + "..." if len(SAMPLE_TRANSLATION) > 100 else SAMPLE_TRANSLATION,
+                "processing_time": SAMPLE_TRANSLATION_TIME,
+                "status": "ok" if SAMPLE_TRANSLATION_ERROR is None else "error"
+            }
+            if SAMPLE_TRANSLATION_ERROR is not None:
+                basic_health["sample_translation"]["error"] = SAMPLE_TRANSLATION_ERROR
+        
         # Only add GPU info if it's available and not causing errors
         if torch.cuda.is_available():
             try:
@@ -1448,6 +1470,125 @@ async def root():
             {"path": "/optimization-info", "method": "GET", "description": "View implemented optimizations"}
         ]
     }
+
+# Helper functions for health check
+def create_sample_audio_file():
+    """Get path to the test audio file"""
+    
+    # Look for the test file in the expected locations
+    test_file_paths = [
+        "./test.mp3",  # In the root directory
+        "./data/test.mp3",  # In a data subdirectory
+        "/app/test.mp3",  # In Docker container root
+        "/app/data/test.mp3"  # In Docker container data dir
+    ]
+    
+    for test_path in test_file_paths:
+        if os.path.exists(test_path):
+            logger.info(f"Found real test audio file at {test_path}")
+            return test_path
+            
+    # If we get here, the test file wasn't found
+    error_msg = "Error: test.mp3 file not found in any of the expected locations"
+    logger.error(error_msg)
+    logger.error(f"Looked in: {', '.join(test_file_paths)}")
+    raise FileNotFoundError(error_msg)
+
+async def process_sample_audio():
+    """Process a sample audio to verify the transcription pipeline is working"""
+    global SAMPLE_TRANSLATION, SAMPLE_TRANSLATION_ERROR, SAMPLE_TRANSLATION_TIME
+    
+    logger.info("Processing sample audio for health check")
+    
+    if model is None or processor is None:
+        logger.warning("Cannot process sample audio: Model or processor not loaded")
+        SAMPLE_TRANSLATION = None
+        SAMPLE_TRANSLATION_ERROR = "Model not loaded"
+        SAMPLE_TRANSLATION_TIME = None
+        return
+    
+    sample_file = None
+    try:
+        # Get path to test audio file
+        try:
+            sample_file = create_sample_audio_file()
+            logger.info(f"Using test audio file: {sample_file}")
+        except FileNotFoundError as e:
+            logger.error(f"Cannot find test.mp3 file: {str(e)}")
+            SAMPLE_TRANSLATION = None
+            SAMPLE_TRANSLATION_ERROR = f"Test audio file not found: {str(e)}"
+            SAMPLE_TRANSLATION_TIME = None
+            return
+        
+        # Process the audio
+        start_time = time.time()
+        result = process_audio(sample_file, "amh")
+        processing_time = time.time() - start_time
+        
+        # Store the result
+        SAMPLE_TRANSLATION = result.get("text", "")
+        SAMPLE_TRANSLATION_ERROR = None if result["status"] == "completed" else result.get("error", "Unknown error")
+        SAMPLE_TRANSLATION_TIME = processing_time
+        
+        logger.info(f"Sample audio processed in {processing_time:.2f}s")
+        logger.info(f"Sample translation: {SAMPLE_TRANSLATION}")
+        
+    except Exception as e:
+        logger.error(f"Error processing sample audio: {str(e)}")
+        logger.error(traceback.format_exc())
+        SAMPLE_TRANSLATION = None
+        SAMPLE_TRANSLATION_ERROR = str(e)
+        SAMPLE_TRANSLATION_TIME = None
+
+@app.post("/test-translation")
+async def test_translation():
+    """Test the translation pipeline with a sample audio file"""
+    logger.info("Test translation endpoint called")
+    
+    # Check if model is loaded
+    if model is None or processor is None:
+        logger.info("Model not loaded, attempting to load it now")
+        # Try to load the model if it's not loaded yet
+        load_result = await load_model()
+        if load_result["status"] != "success" and load_result["status"] != "already_loaded":
+            logger.error(f"Model could not be loaded: {load_result}")
+            return {
+                "status": "error",
+                "message": "Model could not be loaded",
+                "details": load_result
+            }
+    
+    # Try to find the test.mp3 file first to provide better feedback
+    test_file = None
+    try:
+        test_file = create_sample_audio_file()
+        logger.info(f"Found test.mp3 file at: {test_file}")
+    except FileNotFoundError as e:
+        logger.error(f"Test file not found: {str(e)}")
+        return {
+            "status": "error",
+            "error": f"Test file (test.mp3) not found. Please add a test.mp3 file to one of the expected locations.",
+            "details": str(e)
+        }
+    
+    # Process sample audio
+    await process_sample_audio()
+    
+    # Return results
+    if SAMPLE_TRANSLATION_ERROR is None:
+        return {
+            "status": "success",
+            "translation": SAMPLE_TRANSLATION,
+            "processing_time": SAMPLE_TRANSLATION_TIME,
+            "test_file": test_file
+        }
+    else:
+        return {
+            "status": "error",
+            "error": SAMPLE_TRANSLATION_ERROR,
+            "processing_time": SAMPLE_TRANSLATION_TIME,
+            "test_file": test_file
+        }
 
 # Run the server if executed directly
 if __name__ == "__main__":

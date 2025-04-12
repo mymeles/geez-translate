@@ -36,6 +36,8 @@ services:
       - huggingface_cache:/app/models/cache
       # Mount local model directory 
       - ./models:/app/models
+      # Mount test audio file for easy updates
+      - ./test.mp3:/app/test.mp3:ro
     # GPU configuration
     deploy:
       resources:
