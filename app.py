@@ -414,10 +414,10 @@ async def load_model():
                         f"Please run download_model.py to fetch the model before running in offline mode."
                     )
                     
-                # Apply INT8 quantization if enabled (on supported GPUs)
-                if USE_QUANTIZATION and DEVICE == "cuda":
+                # Apply INT8 quantization only on CPU - dynamic quantization is not supported on CUDA
+                if USE_QUANTIZATION and DEVICE == "cpu":
                     try:
-                        logger.info("Applying dynamic INT8 quantization to model")
+                        logger.info("Applying dynamic INT8 quantization to model (CPU only)")
                         model = torch.quantization.quantize_dynamic(
                             model, 
                             {torch.nn.Linear}, 
@@ -425,7 +425,10 @@ async def load_model():
                         )
                         logger.info("Quantization applied successfully")
                     except Exception as e:
-                        logger.warning(f"Quantization failed, continuing with FP16 model: {str(e)}")
+                        logger.warning(f"Quantization failed, continuing with unquantized model: {str(e)}")
+                elif USE_QUANTIZATION and DEVICE == "cuda":
+                    # Log that dynamic quantization is skipped on CUDA
+                    logger.info("Dynamic INT8 quantization is not supported on CUDA. Using FP16 precision instead.")
                 
                 # Apply model compilation with torch.compile if available (PyTorch 2.0+)
                 if USE_TORCH_COMPILE and DEVICE == "cuda" and hasattr(torch, 'compile'):
@@ -1438,7 +1441,7 @@ async def debug_info():
                 "cudnn_version": torch.backends.cudnn.version(),
                 "cudnn_enabled": torch.backends.cudnn.enabled,
                 "cudnn_benchmark": torch.backends.cudnn.benchmark,
-                "quantization_enabled": USE_QUANTIZATION,
+                "quantization_enabled": USE_QUANTIZATION if DEVICE == "cpu" else "Not supported on CUDA",
                 "torch_compile_enabled": USE_TORCH_COMPILE,
                 "cuda_graph_captured": model_graph_captured
             }
@@ -1479,10 +1482,16 @@ async def optimization_info():
     """Get information about implemented optimizations"""
     logger.info("Optimization info requested")
     
+    # Determine quantization status based on device
+    if DEVICE == "cuda":
+        quantization_status = "Disabled for CUDA (not supported) - using FP16 precision instead"
+    else:
+        quantization_status = f"INT8 dynamic quantization {'enabled' if USE_QUANTIZATION else 'disabled'} (CPU only)"
+    
     return {
         "model_optimizations": {
             "model_size": f"Using {MODEL_ID} model variant",
-            "quantization": f"INT8 quantization {'enabled' if USE_QUANTIZATION else 'disabled'}",
+            "quantization": quantization_status,
             "model_compilation": f"PyTorch compilation {'enabled' if USE_TORCH_COMPILE else 'disabled'}",
             "cuda_graph": f"CUDA graph optimization {'active' if model_graph_captured else 'inactive'}"
         },
