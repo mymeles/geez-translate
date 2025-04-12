@@ -45,14 +45,15 @@ if [ ! -d "./models/seamless-m4t-v2-${MODEL_SIZE}" ]; then
     fi
     
     # Create Python virtual environment if it doesn't exist
-    if [ ! -d "model-venv" ]; then
+    VENV_DIR="model-venv"
+    if [ ! -d "$VENV_DIR" ]; then
         echo "Creating Python virtual environment..."
-        python3 -m venv venv
+        python3 -m venv $VENV_DIR
     fi
     
     # Activate virtual environment
     echo "Activating Python virtual environment..."
-    source venv/bin/activate
+    source $VENV_DIR/bin/activate
     
     # Install dependencies from requirements file
     echo "Installing required packages from requirements-model-download.txt..."
