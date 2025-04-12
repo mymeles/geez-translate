@@ -235,9 +235,6 @@ completed_jobs = {}
 processor = None
 model = None
 model_loading_lock = False
-model_graph_captured = False
-cuda_graph = None
-dummy_input = None
 
 # Initialize CUDA streams for parallel processing
 cuda_streams = {}
@@ -248,7 +245,7 @@ if torch.cuda.is_available():
     }
 
 async def load_model():
-    global processor, model, model_loading_lock, model_graph_captured, cuda_graph, dummy_input
+    global processor, model, model_loading_lock
     
     if model_loading_lock:
         logger.warning("Model loading already in progress")
@@ -590,74 +587,16 @@ def process_audio(audio_path, target_language="amh"):
         # Generate transcription with improved error handling
         logger.info("Generating transcription...")
         try:
-            # Set a timeout for generation to prevent hangs
-            if DEVICE == "cuda":
-                # Wait for preprocessing to complete
-                torch.cuda.current_stream().wait_stream(cuda_streams["preprocessing"])
-                
             # Use inference mode (faster than no_grad) and autocast for mixed precision
             with torch.inference_mode(), torch.cuda.amp.autocast(enabled=DEVICE=="cuda"):
                 logger.info("Starting model generation with inference_mode and autocast")
                 
-                # Try to use CUDA graph if previously captured (for repeated similar-sized inputs)
-                if model_graph_captured and cuda_graph is not None and dummy_input is not None:
-                    try:
-                        # Check if current input is compatible with captured graph
-                        if all(inputs[k].shape == dummy_input[k].shape for k in inputs if k in dummy_input):
-                            logger.info("Using captured CUDA graph for inference")
-                            # Copy inputs to dummy inputs
-                            for k in inputs:
-                                if k in dummy_input:
-                                    dummy_input[k].copy_(inputs[k])
-                            # Replay graph
-                            cuda_graph.replay()
-                            # Extract result
-                            output_tokens = model.generate(
-                                **inputs,
-                                tgt_lang=target_language,
-                                num_beams=1  # Use greedy decoding for faster inference
-                            )
-                        else:
-                            logger.info("Input shape mismatch, falling back to standard inference")
-                            output_tokens = model.generate(
-                                **inputs,
-                                tgt_lang=target_language,
-                                num_beams=1  # Use greedy decoding for faster inference
-                            )
-                    except Exception as e:
-                        logger.warning(f"CUDA graph replay failed: {str(e)}, falling back to standard inference")
-                        output_tokens = model.generate(
-                            **inputs,
-                            tgt_lang=target_language,
-                            num_beams=1  # Use greedy decoding for faster inference
-                        )
-                else:
-                    # Standard inference path
-                    output_tokens = model.generate(
-                        **inputs,
-                        tgt_lang=target_language,
-                        num_beams=1  # Use greedy decoding for faster inference
-                    )
-                
-                # Try to capture CUDA graph for future runs
-                if not model_graph_captured and DEVICE == "cuda" and torch.cuda.is_available():
-                    try:
-                        logger.info("Attempting to capture CUDA graph for future inference")
-                        # Clone inputs for graph capture
-                        dummy_input = {k: v.clone() for k, v in inputs.items()}
-                        # Create CUDA graph
-                        cuda_graph = torch.cuda.CUDAGraph()
-                        with torch.cuda.graph(cuda_graph):
-                            model.generate(
-                                **dummy_input,
-                                tgt_lang=target_language,
-                                num_beams=1
-                            )
-                        model_graph_captured = True
-                        logger.info("CUDA graph captured successfully")
-                    except Exception as e:
-                        logger.warning(f"Failed to capture CUDA graph: {str(e)}")
-                        model_graph_captured = False
+                # Standard inference path
+                output_tokens = model.generate(
+                    **inputs,
+                    tgt_lang=target_language,
+                    num_beams=1  # Use greedy decoding for faster inference
+                )
                 
                 logger.info("Model generation completed")
             
@@ -1391,7 +1330,6 @@ async def debug_info():
                 "cudnn_version": torch.backends.cudnn.version(),
                 "cudnn_enabled": torch.backends.cudnn.enabled,
                 "cudnn_benchmark": torch.backends.cudnn.benchmark,
-                "cuda_graph_captured": model_graph_captured,
                 "quantization_enabled": USE_QUANTIZATION,
                 "torch_compile_enabled": USE_TORCH_COMPILE
             }
@@ -1440,7 +1378,6 @@ async def optimization_info():
         },
         "gpu_optimizations": {
             "cuda_streams": "Using separate CUDA streams for preprocessing and inference",
-            "cuda_graphs": f"CUDA graph capture {'active' if model_graph_captured else 'inactive'}",
             "precision": "Using mixed precision (FP16) on GPU" if DEVICE == "cuda" else "N/A",
             "memory_pinning": "Using pinned memory for fast transfers" if DEVICE == "cuda" else "N/A",
             "tf32_enabled": torch.backends.cuda.matmul.allow_tf32 if DEVICE == "cuda" else "N/A",
