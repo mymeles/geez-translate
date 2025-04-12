@@ -66,13 +66,6 @@ RUN pip install --user -r requirements.txt && \
     pip install --user numba && \
     pip install --user psutil
 
-# Preload the model to avoid downloading during runtime
-# This step is optional - comment out if you want to reduce image size
-RUN python -c "from transformers import AutoProcessor, SeamlessM4Tv2ForSpeechToText; \
-    processor = AutoProcessor.from_pretrained('facebook/seamless-m4t-v2-medium'); \
-    processor.save_pretrained('/app/models/seamless-m4t-v2-medium'); \
-    print('Processor saved successfully');"
-
 # Copy application code
 USER root
 COPY app.py .
@@ -92,5 +85,3 @@ EXPOSE 8000
 # Health check
 HEALTHCHECK --interval=30s --timeout=60s --start-period=60s --retries=5 \
     CMD curl -f http://localhost:8000/health || exit 1
-
-# No default command - will be provided by docker-compose

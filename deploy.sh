@@ -123,6 +123,7 @@ fi
 
 # Build and start containers
 echo "Building and starting containers for ${MODEL_SIZE} model..."
+sudo apt-get install docker-compose-plugin
 docker compose build && docker compose up -d
 
 echo ""
