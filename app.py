@@ -565,23 +565,20 @@ def process_audio(audio_path, target_language="amh"):
         if audio_length > CHUNK_SIZE:
             return process_audio_in_chunks(audio, sample_rate, target_language)
         
-        # Convert audio to tensor and move directly to GPU with pinned memory for faster transfer
-        if DEVICE == "cuda":
-            with torch.cuda.stream(cuda_streams["preprocessing"]):
-                # Use pinned memory for faster CPU-to-GPU transfer
-                audio_tensor = torch.tensor(audio).pin_memory().to(DEVICE, non_blocking=True)
-        else:
-            audio_tensor = torch.tensor(audio).to(DEVICE)
-        
-        # Process the audio
-        logger.info("Creating input tensors...")
+        # Process the audio using the processor
+        logger.info("Creating input tensors via processor...")
         try:
+            # Pass the NumPy audio array directly. 
+            # The processor handles tensor conversion internally.
+            # We move the *output* of the processor to the correct device.
             if DEVICE == "cuda":
                 with torch.cuda.stream(cuda_streams["preprocessing"]):
-                    inputs = processor(audios=audio_tensor, sampling_rate=sample_rate, return_tensors="pt", padding=True).to(DEVICE)
+                    inputs = processor(audios=audio, sampling_rate=sample_rate, return_tensors="pt", padding=True).to(DEVICE)
             else:
+                # For CPU, just process and ensure it's on the CPU device
                 inputs = processor(audios=audio, sampling_rate=sample_rate, return_tensors="pt", padding=True).to(DEVICE)
-            logger.info(f"Input created successfully: {inputs.keys()}")
+            
+            logger.info(f"Processor created inputs successfully: {inputs.keys()}")
         except Exception as e:
             logger.error(f"Error creating inputs: {str(e)}")
             logger.error(traceback.format_exc())
@@ -720,6 +717,11 @@ def process_audio_in_chunks(audio, sample_rate, target_language="amh"):
     try:
         logger.info(f"Processing audio in chunks: length={len(audio)/sample_rate:.2f}s")
         
+        # Check model/processor
+        if model is None or processor is None:
+            logger.error("Model or processor not loaded for chunk processing")
+            raise ValueError("Model or processor not loaded yet.")
+        
         # Calculate chunk sizes in samples
         chunk_size_samples = int(CHUNK_SIZE * sample_rate)
         overlap_samples = int(CHUNK_OVERLAP * sample_rate)
@@ -740,33 +742,38 @@ def process_audio_in_chunks(audio, sample_rate, target_language="amh"):
         for i, chunk in enumerate(audio_chunks):
             logger.info(f"Processing chunk {i+1}/{len(audio_chunks)}")
             
-            # Convert audio chunk to tensor
-            if DEVICE == "cuda":
-                with torch.cuda.stream(cuda_streams["preprocessing"]):
-                    # Use pinned memory for faster transfer
-                    chunk_tensor = torch.tensor(chunk).pin_memory().to(DEVICE, non_blocking=True)
-            else:
-                chunk_tensor = torch.tensor(chunk).to(DEVICE)
-            
-            # Process chunk
-            with torch.inference_mode(), torch.cuda.amp.autocast(enabled=DEVICE=="cuda"):
-                # Create inputs
-                inputs = processor(audios=chunk_tensor, sampling_rate=sample_rate, return_tensors="pt").to(DEVICE)
+            # Process chunk using the processor (expects CPU data)
+            try:
+                if DEVICE == "cuda":
+                    with torch.cuda.stream(cuda_streams["preprocessing"]):
+                        inputs = processor(audios=chunk, sampling_rate=sample_rate, return_tensors="pt", padding=True).to(DEVICE)
+                else:
+                    inputs = processor(audios=chunk, sampling_rate=sample_rate, return_tensors="pt", padding=True).to(DEVICE)
                 
-                # Generate
-                output_tokens = model.generate(
-                    **inputs,
-                    tgt_lang=target_language,
-                    num_beams=1  # Use greedy decoding for faster inference
-                )
+                # Wait for preprocessing if on GPU
+                if DEVICE == "cuda":
+                    torch.cuda.current_stream().wait_stream(cuda_streams["preprocessing"])
+                
+                # Generate transcription for the chunk
+                with torch.inference_mode(), torch.cuda.amp.autocast(enabled=DEVICE=="cuda"):
+                    output_tokens = model.generate(
+                        **inputs,
+                        tgt_lang=target_language,
+                        num_beams=1  # Use greedy decoding for faster inference
+                    )
                 
                 # Decode
                 chunk_text = processor.decode(output_tokens[0].tolist(), skip_special_tokens=True)
                 results.append(chunk_text)
+                logger.info(f"Chunk {i+1} result: '{chunk_text[:30]}...'")
+                
+            except Exception as chunk_e:
+                logger.error(f"Error processing chunk {i+1}: {str(chunk_e)}")
+                # Optionally append an error marker or skip the chunk
+                results.append("[CHUNK_ERROR]")
         
         # Combine results
-        # This is a simple concatenation - in production you might want 
-        # more sophisticated text merging to handle overlaps
+        # A simple concatenation - more sophisticated merging might be needed
         transcribed_text = " ".join(results)
         
         processing_time = time.time() - start_time
