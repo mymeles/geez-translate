@@ -15,8 +15,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128 \
     # Force CUDA to use spawn for multiprocessing
     PYTORCH_MULTIPROCESSING_START_METHOD=spawn \
-    # Force transformers to use local files
-    TRANSFORMERS_OFFLINE=1
+    # Don't force offline mode by default - will be set in docker-compose
+    # TRANSFORMERS_OFFLINE=1
+    PATH="/home/appuser/.local/bin:${PATH}"
 
 # Install system dependencies and clean up in one layer
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -47,6 +48,7 @@ RUN chown -R appuser:appuser /app
 
 # Create model cache directory and model directory structure
 RUN mkdir -p /app/models/cache && \
+    mkdir -p /app/models/seamless-m4t-v2-large && \
     mkdir -p /app/models/seamless-m4t-v2-medium && \
     chown -R appuser:appuser /app/models
 
@@ -66,18 +68,17 @@ RUN pip install --user -r requirements.txt && \
     pip install --user numba && \
     pip install --user psutil
 
-# Copy application code
+# Copy application code and download script
 USER root
 COPY app.py .
+COPY download_model.py .
+RUN chmod +x download_model.py
 
 # Set proper permissions for the app directory
 RUN chown -R appuser:appuser /app
 
 # Switch back to non-root user
 USER appuser
-
-# Add user's .local/bin to PATH for installed packages
-ENV PATH="/home/appuser/.local/bin:${PATH}"
 
 # Expose the port
 EXPOSE 8000

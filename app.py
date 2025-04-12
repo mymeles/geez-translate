@@ -215,7 +215,6 @@ if torch.cuda.is_available():
         "inference": torch.cuda.Stream()
     }
 
-# Lazy load function for the model
 async def load_model():
     global processor, model, model_loading_lock, model_graph_captured, cuda_graph, dummy_input
     
@@ -241,27 +240,94 @@ async def load_model():
             model_loading_lock = False
             return {"status": "error", "message": f"Failed to import required libraries: {str(e)}"}
         
+        # Check if we're in offline mode
+        is_offline = os.getenv("TRANSFORMERS_OFFLINE", "0").lower() in ("1", "true")
+        local_files_only = is_offline
+        logger.info(f"Operating in {'offline' if is_offline else 'online'} mode (local_files_only={local_files_only})")
+        
         # Load processor first
         try:
             logger.info("Loading processor...")
             # Handle local model loading properly
             if LOCAL_MODEL:
                 logger.info(f"Loading processor from local path: {MODEL_ID}")
-                # For local models, we need to load the processor from the local path
+                
+                # Check for processor files
+                model_files = os.listdir(MODEL_ID) if os.path.exists(MODEL_ID) else []
+                logger.info(f"Found {len(model_files)} files in model directory: {', '.join(model_files[:5])}{'...' if len(model_files) > 5 else ''}")
+                
                 # Check if there's a processor config or model files
                 processor_config_path = os.path.join(MODEL_ID, "processor_config.json")
+                tokenizer_config_path = os.path.join(MODEL_ID, "tokenizer_config.json")
+                feature_extractor_path = os.path.join(MODEL_ID, "feature_extractor_config.json")
+                
+                # First try: Check if main processor configs exist
                 if os.path.exists(processor_config_path):
-                    logger.info(f"Found processor config at {processor_config_path}")
+                    logger.info(f"Found processor config, loading from {MODEL_ID}")
                     processor = AutoProcessor.from_pretrained(MODEL_ID, local_files_only=True)
+                # Second try: Check if tokenizer config exists
+                elif os.path.exists(tokenizer_config_path) or os.path.exists(feature_extractor_path):
+                    logger.info(f"Found tokenizer/feature extractor config, loading from {MODEL_ID}")
+                    # Additional debug info about the directory contents
+                    logger.info(f"Model directory contents: {', '.join(model_files)}")
+                    
+                    try:
+                        from transformers import SeamlessM4TProcessor, AutoTokenizer, AutoFeatureExtractor
+                        
+                        # Use specific processor class if possible
+                        if 'seamless-m4t' in MODEL_ID:
+                            logger.info("Using SeamlessM4TProcessor for better compatibility")
+                            processor = SeamlessM4TProcessor.from_pretrained(MODEL_ID, local_files_only=True)
+                        else:
+                            # Manually construct processor from components
+                            logger.info("Attempting to manually construct processor from components")
+                            tokenizer = None
+                            feature_extractor = None
+                            
+                            if os.path.exists(tokenizer_config_path):
+                                logger.info("Loading tokenizer...")
+                                tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, local_files_only=True)
+                            
+                            if os.path.exists(feature_extractor_path):
+                                logger.info("Loading feature extractor...")
+                                feature_extractor = AutoFeatureExtractor.from_pretrained(MODEL_ID, local_files_only=True)
+                            
+                            if tokenizer and feature_extractor:
+                                # Create processor
+                                processor = AutoProcessor.from_pretrained(MODEL_ID, local_files_only=True)
+                            else:
+                                raise ValueError("Could not load tokenizer and feature extractor components")
+                    except Exception as component_err:
+                        logger.error(f"Error loading processor components: {str(component_err)}")
+                        if not is_offline:
+                            # Try downloading if we're online
+                            logger.warning("Attempting to download processor from HuggingFace...")
+                            processor = AutoProcessor.from_pretrained("facebook/seamless-m4t-v2-large", local_files_only=False)
+                            processor.save_pretrained(MODEL_ID)
+                        else:
+                            raise
+                elif not is_offline:
+                    # Try the facebook model ID as fallback if we're not in offline mode
+                    logger.warning(f"No processor config found at {MODEL_ID}, downloading from facebook/seamless-m4t-v2-large")
+                    try:
+                        # Try downloading from HF with trace
+                        processor = AutoProcessor.from_pretrained("facebook/seamless-m4t-v2-large", local_files_only=False)
+                        # Save it locally for future use
+                        processor.save_pretrained(MODEL_ID)
+                        logger.info(f"Saved processor to {MODEL_ID} for future use")
+                    except Exception as e:
+                        logger.error(f"Error downloading processor: {str(e)}")
+                        raise ValueError(f"No processor config found at {MODEL_ID} and could not download: {str(e)}")
                 else:
-                    # Try the facebook model ID as fallback
-                    logger.warning(f"No processor config found at {processor_config_path}, using facebook/seamless-m4t-v2-medium")
-                    processor = AutoProcessor.from_pretrained("facebook/seamless-m4t-v2-medium")
-                    # Save the processor to the local path for future use
-                    processor.save_pretrained(MODEL_ID)
-                    logger.info(f"Saved processor to {MODEL_ID} for future use")
+                    # We're in offline mode with no processor config
+                    raise ValueError(
+                        f"No processor config found at {MODEL_ID} and offline mode is enabled. "
+                        f"Please run download_model.py to fetch the model before running in offline mode."
+                    )
             else:
-                processor = AutoProcessor.from_pretrained(MODEL_ID)
+                # Using online model ID
+                processor = AutoProcessor.from_pretrained(MODEL_ID, local_files_only=local_files_only)
+                
             logger.info("Processor loaded successfully")
         except Exception as e:
             logger.error(f"Error loading processor: {str(e)}")
@@ -275,50 +341,44 @@ async def load_model():
             # For M1 Mac compatibility, use chunked loading
             if "arm64" in platform.machine().lower() and DEVICE == "cpu":
                 logger.info("Detected ARM64 platform, using float32 precision")
-                if LOCAL_MODEL:
-                    model = SeamlessM4Tv2ForSpeechToText.from_pretrained(
-                        MODEL_ID,
-                        low_cpu_mem_usage=True,
-                        torch_dtype=torch.float32,  # Use float32 instead of half precision on M1
-                        local_files_only=True
-                    ).to(DEVICE)
-                else:
-                    model = SeamlessM4Tv2ForSpeechToText.from_pretrained(
-                        MODEL_ID, 
-                        low_cpu_mem_usage=True,
-                        torch_dtype=torch.float32  # Use float32 instead of half precision on M1
-                    ).to(DEVICE)
+                model = SeamlessM4Tv2ForSpeechToText.from_pretrained(
+                    MODEL_ID,
+                    low_cpu_mem_usage=True,
+                    torch_dtype=torch.float32,  # Use float32 instead of half precision on M1
+                    local_files_only=local_files_only
+                ).to(DEVICE)
             else:
                 # For GPU, use half precision and better memory optimization
                 logger.info("Using GPU optimization with float16 precision")
-                if LOCAL_MODEL:
-                    # Handle the case where a locally saved model might not exist yet
-                    model_config_path = os.path.join(MODEL_ID, "config.json")
-                    if os.path.exists(model_config_path):
-                        logger.info(f"Loading model from local path: {MODEL_ID}")
-                        model = SeamlessM4Tv2ForSpeechToText.from_pretrained(
-                            MODEL_ID,
-                            torch_dtype=torch.float16 if DEVICE == "cuda" else None,
-                            low_cpu_mem_usage=True,
-                            local_files_only=True
-                        ).to(DEVICE)
-                    else:
-                        # Try the facebook model ID as fallback
-                        logger.warning(f"No model config found at {model_config_path}, using facebook/seamless-m4t-v2-medium")
-                        model = SeamlessM4Tv2ForSpeechToText.from_pretrained(
-                            "facebook/seamless-m4t-v2-medium",
-                            torch_dtype=torch.float16 if DEVICE == "cuda" else None,
-                            low_cpu_mem_usage=True
-                        ).to(DEVICE)
-                        # Save the model to the local path for future use
-                        model.save_pretrained(MODEL_ID)
-                        logger.info(f"Saved model to {MODEL_ID} for future use")
-                else:
+                
+                # Handle the case where a locally saved model might not exist yet
+                model_config_path = os.path.join(MODEL_ID, "config.json")
+                if os.path.exists(model_config_path):
+                    logger.info(f"Loading model from local path: {MODEL_ID}")
                     model = SeamlessM4Tv2ForSpeechToText.from_pretrained(
                         MODEL_ID,
                         torch_dtype=torch.float16 if DEVICE == "cuda" else None,
-                        low_cpu_mem_usage=True
+                        low_cpu_mem_usage=True,
+                        local_files_only=True
                     ).to(DEVICE)
+                elif not is_offline:
+                    # Try the facebook model ID as fallback if we're not in offline mode
+                    logger.warning(f"No model config found at {model_config_path}, using facebook/seamless-m4t-v2-medium")
+                    model = SeamlessM4Tv2ForSpeechToText.from_pretrained(
+                        "facebook/seamless-m4t-v2-medium",
+                        torch_dtype=torch.float16 if DEVICE == "cuda" else None,
+                        low_cpu_mem_usage=True,
+                        local_files_only=False
+                    ).to(DEVICE)
+                    # Save the model to the local path for future use
+                    model.save_pretrained(MODEL_ID)
+                    logger.info(f"Saved model to {MODEL_ID} for future use")
+                else:
+                    # We're in offline mode with no model config
+                    raise ValueError(
+                        f"No model config found at {MODEL_ID} and offline mode is enabled. "
+                        f"Please run download_model.py to fetch the model before running in offline mode."
+                    )
                     
                 # Apply INT8 quantization if enabled (on supported GPUs)
                 if USE_QUANTIZATION and DEVICE == "cuda":

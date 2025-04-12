@@ -19,21 +19,21 @@ services:
       - MODEL_SIZE=${MODEL_SIZE:-large}
       - MODEL_PATH=/app/models/seamless-m4t-v2-${MODEL_SIZE:-large}
       - LOAD_MODEL_ON_STARTUP=true
-      - TRANSFORMERS_CACHE=/home/appuser/.cache/huggingface
-      - HF_HOME=/home/appuser/.cache/huggingface
+      - TRANSFORMERS_CACHE=/app/models/cache
+      - HF_HOME=/app/models/cache
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - PYTHONUNBUFFERED=1
       # Fix for CUDA multiprocessing
       - PYTORCH_MULTIPROCESSING_START_METHOD=spawn
-      # Fix for transformer auto-detection of local models
-      - TRANSFORMERS_OFFLINE=1
+      # Start in online mode for model download, then switch to offline later
+      - TRANSFORMERS_OFFLINE=${TRANSFORMERS_OFFLINE:-0}
       # Optimization environment variables
       - USE_QUANTIZATION=${USE_QUANTIZATION:-true}
       - USE_TORCH_COMPILE=${USE_TORCH_COMPILE:-true}
       - CHUNK_SIZE=${CHUNK_SIZE:-5}
       - CHUNK_OVERLAP=${CHUNK_OVERLAP:-0.5}
     volumes:
-      - huggingface_cache:/home/appuser/.cache/huggingface
+      - huggingface_cache:/app/models/cache
       # Mount local model directory 
       - ./models:/app/models
     # GPU configuration
@@ -44,16 +44,65 @@ services:
             - driver: nvidia
               count: 1
               capabilities: [gpu]
+    # Modified command to check if model exists and download if needed
     command: >
-      gunicorn app:app 
-      --bind 0.0.0.0:8000 
-      --workers 1 
-      --worker-class uvicorn.workers.UvicornWorker 
-      --timeout 300 
-      --log-level ${LOG_LEVEL:-info}
-      --access-logfile - 
-      --error-logfile - 
-      --worker-tmp-dir /dev/shm 
+      bash -c "
+        MODEL_DIR=/app/models/seamless-m4t-v2-${MODEL_SIZE:-large}
+        CONFIG_FILE=$${MODEL_DIR}/config.json
+        PROCESSOR_CONFIG=$${MODEL_DIR}/processor_config.json
+        TOKENIZER_CONFIG=$${MODEL_DIR}/tokenizer_config.json
+        FEATURE_EXTRACTOR=$${MODEL_DIR}/feature_extractor_config.json
+
+        # Check if model and processor exist in the container
+        if [ ! -f $${CONFIG_FILE} ] || ([ ! -f $${PROCESSOR_CONFIG} ] && [ ! -f $${TOKENIZER_CONFIG} ] && [ ! -f $${FEATURE_EXTRACTOR} ]); then
+          echo '--------------------------------------------------------------'
+          echo 'Model or processor not found, downloading...'
+          echo '--------------------------------------------------------------'
+          
+          # Ensure online mode during download
+          export TRANSFORMERS_OFFLINE=0
+          
+          # Download model with processor
+          python download_model.py --model-id facebook/seamless-m4t-v2-${MODEL_SIZE:-large} --cache-dir $${MODEL_DIR} --force
+          
+          # Check if download was successful
+          if [ -f $${CONFIG_FILE} ] && ([ -f $${PROCESSOR_CONFIG} ] || [ -f $${TOKENIZER_CONFIG} ] || [ -f $${FEATURE_EXTRACTOR} ]); then
+            echo '--------------------------------------------------------------'
+            echo 'Model and processor download complete, switching to offline mode'
+            echo '--------------------------------------------------------------'
+            export TRANSFORMERS_OFFLINE=1
+          else
+            echo '--------------------------------------------------------------'
+            echo 'WARNING: Model download may not be complete, check logs for errors'
+            echo 'Directory contents:'
+            ls -la $${MODEL_DIR}
+            echo '--------------------------------------------------------------'
+            # Stay in online mode to allow fallback
+            export TRANSFORMERS_OFFLINE=0
+          fi
+        else
+          echo '--------------------------------------------------------------'
+          echo 'Model and processor already exist'
+          echo '--------------------------------------------------------------'
+          ls -la $${MODEL_DIR} | head -20
+          echo '--------------------------------------------------------------'
+          echo 'Setting offline mode'
+          export TRANSFORMERS_OFFLINE=1
+        fi
+        
+        # Start the application
+        echo '--------------------------------------------------------------'
+        echo 'Starting API server'
+        echo '--------------------------------------------------------------'
+        gunicorn app:app 
+        --bind 0.0.0.0:8000 
+        --workers 1 
+        --worker-class uvicorn.workers.UvicornWorker 
+        --timeout 300 
+        --log-level ${LOG_LEVEL:-info}
+        --access-logfile - 
+        --error-logfile - 
+        --worker-tmp-dir /dev/shm"
 
   # Optional Nginx reverse proxy with enhanced caching
   nginx:

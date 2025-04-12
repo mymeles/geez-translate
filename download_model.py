@@ -94,7 +94,30 @@ def main():
             force_download=args.force
         )
         # Save processor directly to the specified directory
+        logger.info(f"Saving processor to {cache_dir}...")
         processor.save_pretrained(cache_dir)
+        
+        # Verify processor files were saved correctly
+        processor_files = os.listdir(cache_dir)
+        logger.info(f"Processor files saved: {', '.join(processor_files[:10])}...")
+        
+        # Explicitly check for processor_config.json
+        processor_config_path = os.path.join(cache_dir, "processor_config.json")
+        if os.path.exists(processor_config_path):
+            logger.info(f"Verified processor_config.json was saved successfully")
+        else:
+            logger.warning(f"processor_config.json not found in {cache_dir}!")
+            
+            # Try to get from tokenizer_config.json if available
+            if hasattr(processor, "tokenizer") and hasattr(processor.tokenizer, "save_pretrained"):
+                logger.info("Explicitly saving tokenizer configuration...")
+                processor.tokenizer.save_pretrained(cache_dir)
+                
+            # Check for special processor attributes to save
+            if hasattr(processor, "feature_extractor") and hasattr(processor.feature_extractor, "save_pretrained"):
+                logger.info("Explicitly saving feature extractor configuration...")
+                processor.feature_extractor.save_pretrained(cache_dir)
+        
         processor_time = time.time() - processor_start_time
         logger.info(f"Processor downloaded and saved successfully in {processor_time:.2f} seconds.")
         
@@ -107,6 +130,7 @@ def main():
             low_cpu_mem_usage=True
         )
         # Save model directly to the specified directory
+        logger.info(f"Saving model to {cache_dir}...")
         model.save_pretrained(cache_dir)
         model_time = time.time() - model_start_time
         logger.info(f"Model downloaded and saved successfully in {model_time:.2f} seconds.")
