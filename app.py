@@ -10,6 +10,10 @@ import logging
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.requests import Request
 from starlette.responses import Response
+from fastapi.responses import StreamingResponse
+from sse_starlette.sse import EventSourceResponse
+import asyncio
+import json
 
 # Import numpy first and set environment variable to prevent _ARRAY_API error on M1 Macs
 os.environ["NUMPY_EXPERIMENTAL_ARRAY_FUNCTION"] = "0"
@@ -169,13 +173,14 @@ class LoggingMiddleware(BaseHTTPMiddleware):
 # Add the logging middleware *early* in the middleware stack
 app.add_middleware(LoggingMiddleware)
 
-# Enable CORS *after* the logging middleware
+# Find the existing CORS middleware in app.py and update it like this:
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # Modify in production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["Content-Type", "Content-Length", "Content-Range", "Content-Disposition"],
 )
 
 # Request and response models
@@ -966,6 +971,236 @@ async def process_audio_task(file_path, job_id, target_language):
         
         logger.info(f"===================== BACKGROUND TASK COMPLETED FOR JOB {job_id} =====================")
         logger.info(f"Total task time: {time.time() - task_start_time:.2f}s")
+        
+# Add this new streaming endpoint
+@app.post("/stream-transcribe")
+async def stream_transcribe(
+    file: UploadFile = File(...),
+    target_language: str = Form("amh")
+):
+    """
+    Stream transcription results as they are processed.
+    Uses Server-Sent Events (SSE) to stream partial results to the client.
+    """
+    logger.info("===================== STREAM TRANSCRIBE REQUEST STARTED =====================")
+    logger.info(f"Stream transcribe request received - File: {file.filename}, Target language: {target_language}")
+    
+    # Check if model is loaded
+    if model is None or processor is None:
+        logger.info("Model not loaded, attempting to load it now")
+        # Try to load the model if it's not loaded yet
+        load_result = await load_model()
+        if load_result["status"] != "success" and load_result["status"] != "already_loaded":
+            logger.error(f"Model could not be loaded: {load_result}")
+            raise HTTPException(
+                status_code=503, 
+                detail="Model could not be loaded. Please try again later."
+            )
+    
+    # Generate a unique ID for this job
+    job_id = str(uuid.uuid4())
+    logger.info(f"Generated streaming job ID: {job_id}")
+    
+    # Get file extension for proper handling
+    original_filename = file.filename
+    file_extension = ""
+    if original_filename and '.' in original_filename:
+        file_extension = os.path.splitext(original_filename)[1].lower()
+    if not file_extension:
+        file_extension = ".tmpaudio"
+    
+    # Save the uploaded file temporarily
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=file_extension) as temp_file:
+            logger.info(f"Created temp file for streaming: {temp_file.name}")
+            content = await file.read()
+            logger.info(f"Read {len(content)} bytes from uploaded file")
+            temp_file.write(content)
+            temp_file_path = temp_file.name
+            logger.info(f"File saved to: {temp_file_path}")
+    except Exception as save_error:
+        logger.error(f"Error saving file: {str(save_error)}")
+        raise HTTPException(status_code=500, detail=f"Error saving uploaded file: {str(save_error)}")
+    
+    # Create an SSE generator
+    async def event_generator():
+        try:
+            # Load audio file
+            try:
+                logger.info(f"Loading audio for streaming: {temp_file_path}")
+                audio, sample_rate = load_audio(temp_file_path, target_sr=16000)
+                audio_length = len(audio) / sample_rate
+                logger.info(f"Audio loaded successfully: length={audio_length:.2f}s, sample_rate={sample_rate}")
+                
+                # Check audio length
+                if audio_length > MAX_AUDIO_LENGTH:
+                    logger.warning(f"Audio too long: {audio_length:.2f}s > {MAX_AUDIO_LENGTH}s")
+                    yield json.dumps({
+                        "event": "error",
+                        "data": {
+                            "message": f"Audio is too long ({audio_length:.2f}s). Maximum allowed is {MAX_AUDIO_LENGTH}s"
+                        }
+                    })
+                    return
+                
+                # Send initial message
+                yield json.dumps({
+                    "event": "info",
+                    "data": {
+                        "job_id": job_id,
+                        "status": "processing",
+                        "message": "Processing started",
+                        "audio_length": audio_length
+                    }
+                })
+                
+                # Process in chunks with streaming results
+                # Calculate chunk sizes in samples
+                chunk_size_samples = int(CHUNK_SIZE * sample_rate)
+                overlap_samples = int(CHUNK_OVERLAP * sample_rate)
+                stride = chunk_size_samples - overlap_samples
+                
+                # If the audio is short, process it in one go
+                if audio_length <= CHUNK_SIZE:
+                    logger.info("Audio is short, processing in one go")
+                    result = process_audio(temp_file_path, target_language)
+                    if result["status"] == "completed":
+                        yield json.dumps({
+                            "event": "result",
+                            "data": {
+                                "text": result["text"],
+                                "is_final": True,
+                                "chunk_index": 0,
+                                "total_chunks": 1,
+                                "processing_time": result["processing_time"]
+                            }
+                        })
+                    else:
+                        yield json.dumps({
+                            "event": "error",
+                            "data": {
+                                "message": f"Error processing audio: {result.get('error', 'Unknown error')}"
+                            }
+                        })
+                else:
+                    # Split audio into overlapping chunks
+                    audio_chunks = []
+                    for i in range(0, len(audio), stride):
+                        chunk = audio[i:i + chunk_size_samples]
+                        # Only process chunks that are long enough
+                        if len(chunk) > 0.5 * sample_rate:  # At least 0.5 seconds
+                            audio_chunks.append(chunk)
+                    
+                    logger.info(f"Split audio into {len(audio_chunks)} chunks for streaming")
+                    
+                    # Process each chunk and stream results
+                    for i, chunk in enumerate(audio_chunks):
+                        logger.info(f"Processing streaming chunk {i+1}/{len(audio_chunks)}")
+                        chunk_start_time = time.time()
+                        
+                        # Save chunk to temporary file for processing
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=file_extension) as chunk_file:
+                            # Convert numpy array back to audio file
+                            try:
+                                import soundfile as sf
+                                sf.write(chunk_file.name, chunk, sample_rate)
+                            except ImportError:
+                                # Fallback to scipy if soundfile is not available
+                                from scipy.io import wavfile
+                                wavfile.write(chunk_file.name, sample_rate, chunk.astype(np.float32))
+                            
+                            chunk_path = chunk_file.name
+                        
+                        # Process chunk
+                        try:
+                            # Process chunk using the processor (expects CPU data)
+                            if DEVICE == "cuda":
+                                with torch.cuda.stream(cuda_streams["preprocessing"]):
+                                    inputs = processor(audios=chunk, sampling_rate=sample_rate, return_tensors="pt", padding=True).to(DEVICE)
+                            else:
+                                inputs = processor(audios=chunk, sampling_rate=sample_rate, return_tensors="pt", padding=True).to(DEVICE)
+                            
+                            # Wait for preprocessing if on GPU
+                            if DEVICE == "cuda":
+                                torch.cuda.current_stream().wait_stream(cuda_streams["preprocessing"])
+                            
+                            # Generate transcription for the chunk
+                            with torch.inference_mode(), torch.cuda.amp.autocast(enabled=DEVICE=="cuda"):
+                                output_tokens = model.generate(
+                                    **inputs,
+                                    tgt_lang=target_language,
+                                    num_beams=1  # Use greedy decoding for faster inference
+                                )
+                            
+                            # Decode
+                            chunk_text = processor.decode(output_tokens[0].tolist(), skip_special_tokens=True)
+                            chunk_processing_time = time.time() - chunk_start_time
+                            
+                            # Stream this chunk result
+                            yield json.dumps({
+                                "event": "result",
+                                "data": {
+                                    "text": chunk_text,
+                                    "is_final": (i == len(audio_chunks) - 1),
+                                    "chunk_index": i,
+                                    "total_chunks": len(audio_chunks),
+                                    "processing_time": chunk_processing_time
+                                }
+                            })
+                            
+                            # Add a small delay to avoid overwhelming the client
+                            await asyncio.sleep(0.05)
+                            
+                            logger.info(f"Streamed chunk {i+1} result: '{chunk_text[:30]}...'")
+                            
+                            # Clean up chunk file
+                            try:
+                                os.unlink(chunk_path)
+                            except Exception as e:
+                                logger.warning(f"Error removing chunk file: {str(e)}")
+                                
+                        except Exception as chunk_e:
+                            logger.error(f"Error processing chunk {i+1}: {str(chunk_e)}")
+                            yield json.dumps({
+                                "event": "error",
+                                "data": {
+                                    "message": f"Error processing chunk {i+1}: {str(chunk_e)}",
+                                    "chunk_index": i
+                                }
+                            })
+                
+                # Send completion message
+                yield json.dumps({
+                    "event": "complete",
+                    "data": {
+                        "job_id": job_id,
+                        "status": "completed",
+                        "message": "Processing completed",
+                        "total_processing_time": time.time() - chunk_start_time
+                    }
+                })
+                
+            except Exception as e:
+                logger.error(f"Error in streaming audio processing: {str(e)}")
+                logger.error(traceback.format_exc())
+                yield json.dumps({
+                    "event": "error",
+                    "data": {
+                        "message": f"Error processing audio: {str(e)}"
+                    }
+                })
+        
+        finally:
+            # Clean up temp file
+            try:
+                if os.path.exists(temp_file_path):
+                    os.unlink(temp_file_path)
+                    logger.info(f"Removed temporary file {temp_file_path}")
+            except Exception as e:
+                logger.warning(f"Error removing temporary file: {str(e)}")
+    
+    # Return SSE response
+    return EventSourceResponse(event_generator())
 
 # API Endpoints
 @app.post("/load-model")
