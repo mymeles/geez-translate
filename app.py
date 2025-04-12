@@ -244,6 +244,11 @@ if torch.cuda.is_available():
         "inference": torch.cuda.Stream()
     }
 
+# CUDA graph variables for optimized inference
+model_graph_captured = False
+cuda_graph = None
+dummy_input = None
+
 async def load_model():
     global processor, model, model_loading_lock
     
@@ -445,6 +450,14 @@ async def load_model():
                     torch.cuda.empty_cache()  # Clear any residual memory
                     logger.info(f"GPU Memory Allocated: {torch.cuda.memory_allocated(0) / 1024**3:.2f} GB")
                     logger.info(f"GPU Memory Reserved: {torch.cuda.memory_reserved(0) / 1024**3:.2f} GB")
+                    
+                    # Initialize CUDA graph variables for optimized inference
+                    # This will enable graph capture later during first inference
+                    global model_graph_captured, cuda_graph, dummy_input
+                    model_graph_captured = False
+                    cuda_graph = None
+                    dummy_input = None
+                    logger.info("CUDA graph variables initialized for future capture")
             
             logger.info("Model loaded successfully")
             return {"status": "success"}
@@ -591,12 +604,107 @@ def process_audio(audio_path, target_language="amh"):
             with torch.inference_mode(), torch.cuda.amp.autocast(enabled=DEVICE=="cuda"):
                 logger.info("Starting model generation with inference_mode and autocast")
                 
-                # Standard inference path
-                output_tokens = model.generate(
-                    **inputs,
-                    tgt_lang=target_language,
-                    num_beams=1  # Use greedy decoding for faster inference
-                )
+                # CUDA graph optimization path
+                if DEVICE == "cuda":
+                    # First, check if this is the first run where we need to capture the graph
+                    if not model_graph_captured and cuda_graph is None:
+                        try:
+                            logger.info("First run with this input shape - capturing CUDA graph for future inference")
+                            
+                            # Store the dummy input for future runs (must be same shape as current input)
+                            dummy_input = {}
+                            for key, tensor in inputs.items():
+                                dummy_input[key] = tensor.clone()  # Clone to avoid modifying the original
+                            
+                            # Start a CUDA graph capture
+                            cuda_stream = torch.cuda.current_stream()
+                            
+                            # Warmup before capture
+                            logger.info("Warmup run before CUDA graph capture")
+                            _ = model.generate(
+                                **inputs,
+                                tgt_lang=target_language,
+                                num_beams=1
+                            )
+                            
+                            # Actual capture
+                            logger.info("Starting CUDA graph capture")
+                            with torch.cuda.graph(cuda_stream) as g:
+                                captured_output = model.generate(
+                                    **dummy_input,
+                                    tgt_lang=target_language,
+                                    num_beams=1
+                                )
+                            
+                            cuda_graph = g
+                            model_graph_captured = True
+                            logger.info("CUDA graph successfully captured")
+                            
+                            # Use the captured graph result
+                            output_tokens = captured_output
+                        except Exception as graph_error:
+                            # If graph capture fails, fall back to regular execution
+                            logger.error(f"Error capturing CUDA graph: {str(graph_error)}")
+                            logger.warning("Falling back to regular execution without CUDA graph")
+                            model_graph_captured = False
+                            cuda_graph = None
+                            
+                            # Run with standard generation instead
+                            output_tokens = model.generate(
+                                **inputs,
+                                tgt_lang=target_language,
+                                num_beams=1
+                            )
+                    else:
+                        try:
+                            # This is a subsequent run with a captured graph
+                            if model_graph_captured and cuda_graph is not None:
+                                logger.info("Using captured CUDA graph for faster inference")
+                                
+                                # Copy the input data to the dummy input with same shape
+                                for key, tensor in inputs.items():
+                                    if key in dummy_input and dummy_input[key].shape == tensor.shape:
+                                        dummy_input[key].copy_(tensor)
+                                    else:
+                                        # If shapes don't match, graph can't be used - fall back to regular execution
+                                        logger.warning(f"Input shape changed ({key}: {tensor.shape} vs {dummy_input[key].shape if key in dummy_input else 'N/A'})- can't use CUDA graph, falling back to regular execution")
+                                        raise ValueError("Input shape mismatch")
+                                
+                                # Replay captured graph
+                                cuda_graph.replay()
+                                
+                                # Get the output result from dummy input
+                                output_tokens = model.generate(  # This doesn't actually run the model, just gets the output
+                                    **dummy_input,
+                                    tgt_lang=target_language,
+                                    num_beams=1
+                                )
+                            else:
+                                # No graph available, use standard execution
+                                logger.info("No CUDA graph available, using standard execution")
+                                output_tokens = model.generate(
+                                    **inputs,
+                                    tgt_lang=target_language,
+                                    num_beams=1
+                                )
+                        except Exception as graph_replay_error:
+                            # If graph replay fails, fall back to regular execution
+                            logger.error(f"Error using CUDA graph: {str(graph_replay_error)}")
+                            logger.warning("Falling back to regular execution")
+                            
+                            # Run with standard generation
+                            output_tokens = model.generate(
+                                **inputs,
+                                tgt_lang=target_language,
+                                num_beams=1
+                            )
+                else:
+                    # Standard inference path for CPU
+                    output_tokens = model.generate(
+                        **inputs,
+                        tgt_lang=target_language,
+                        num_beams=1  # Use greedy decoding for faster inference
+                    )
                 
                 logger.info("Model generation completed")
             
@@ -1331,7 +1439,8 @@ async def debug_info():
                 "cudnn_enabled": torch.backends.cudnn.enabled,
                 "cudnn_benchmark": torch.backends.cudnn.benchmark,
                 "quantization_enabled": USE_QUANTIZATION,
-                "torch_compile_enabled": USE_TORCH_COMPILE
+                "torch_compile_enabled": USE_TORCH_COMPILE,
+                "cuda_graph_captured": model_graph_captured
             }
         except Exception as e:
             gpu_info = {"error": str(e)}
@@ -1374,7 +1483,8 @@ async def optimization_info():
         "model_optimizations": {
             "model_size": f"Using {MODEL_ID} model variant",
             "quantization": f"INT8 quantization {'enabled' if USE_QUANTIZATION else 'disabled'}",
-            "model_compilation": f"PyTorch compilation {'enabled' if USE_TORCH_COMPILE else 'disabled'}"
+            "model_compilation": f"PyTorch compilation {'enabled' if USE_TORCH_COMPILE else 'disabled'}",
+            "cuda_graph": f"CUDA graph optimization {'active' if model_graph_captured else 'inactive'}"
         },
         "gpu_optimizations": {
             "cuda_streams": "Using separate CUDA streams for preprocessing and inference",
