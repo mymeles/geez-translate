@@ -74,28 +74,15 @@ COPY app.py .
 COPY download_model.py .
 RUN chmod +x download_model.py
 
-# Create data directory for test files
+# Create data directory (useful for potential future use)
 RUN mkdir -p /app/data
 
-# Copy test audio file if it exists (using a safer approach)
-# We first create the copy script
-RUN echo '#!/bin/bash\n\
-if [ -f /tmp/build/test.mp3 ]; then\n\
-  cp /tmp/build/test.mp3 /app/\n\
-  echo "Copied test.mp3 to /app/"\n\
-fi\n\
-if [ -f /tmp/build/data/test.mp3 ]; then\n\
-  cp /tmp/build/data/test.mp3 /app/data/\n\
-  echo "Copied test.mp3 to /app/data/"\n\
-fi' > /tmp/copy_test_audio.sh && chmod +x /tmp/copy_test_audio.sh
+# Copy test.mp3 into the container
+# Use RUN commands to handle potential non-existence gracefully
+RUN if [ -f ./test.mp3 ]; then cp ./test.mp3 /app/test.mp3; echo 'Copied ./test.mp3 to /app/'; fi
+RUN if [ -f ./data/test.mp3 ]; then cp ./data/test.mp3 /app/test.mp3; echo 'Copied ./data/test.mp3 to /app/'; fi
 
-# Copy project files to temporary location
-COPY . /tmp/build/
-
-# Execute the script
-RUN /tmp/copy_test_audio.sh && rm -f /tmp/copy_test_audio.sh && rm -rf /tmp/build
-
-# Set proper permissions for the app directory
+# Set proper permissions for the app directory, including the potentially copied test file
 RUN chown -R appuser:appuser /app
 
 # Switch back to non-root user

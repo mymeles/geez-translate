@@ -1473,26 +1473,21 @@ async def root():
 
 # Helper functions for health check
 def create_sample_audio_file():
-    """Get path to the test audio file"""
+    """Get path to the test audio file located in the container"""
     
-    # Look for the test file in the expected locations
-    test_file_paths = [
-        "./test.mp3",  # In the root directory
-        "./data/test.mp3",  # In a data subdirectory
-        "/app/test.mp3",  # In Docker container root
-        "/app/data/test.mp3"  # In Docker container data dir
-    ]
+    # Define the expected path within the Docker container
+    test_file_path = "/app/test.mp3"
     
-    for test_path in test_file_paths:
-        if os.path.exists(test_path):
-            logger.info(f"Found real test audio file at {test_path}")
-            return test_path
-            
-    # If we get here, the test file wasn't found
-    error_msg = "Error: test.mp3 file not found in any of the expected locations"
-    logger.error(error_msg)
-    logger.error(f"Looked in: {', '.join(test_file_paths)}")
-    raise FileNotFoundError(error_msg)
+    # Check if the file exists at the expected path
+    if os.path.exists(test_file_path):
+        logger.info(f"Found test audio file at {test_file_path}")
+        return test_file_path
+    else:
+        # If we get here, the test file wasn't found in the container
+        error_msg = f"Error: test.mp3 file not found at the expected location {test_file_path}"
+        logger.error(error_msg)
+        logger.error("Please ensure test.mp3 exists in the project root or data/ directory before building the Docker image.")
+        raise FileNotFoundError(error_msg)
 
 async def process_sample_audio():
     """Process a sample audio to verify the transcription pipeline is working"""
