@@ -44,30 +44,45 @@ if [ ! -d "./models/seamless-m4t-v2-${MODEL_SIZE}" ]; then
         exit 1
     fi
     
-    # Create Python virtual environment if it doesn't exist
-    VENV_DIR="model-venv"
+    # Create models directory if it doesn't exist
+    mkdir -p "./models/seamless-m4t-v2-${MODEL_SIZE}"
+    
+    # Create a virtual environment with proper permissions
+    VENV_DIR="./ml-env"
     if [ ! -d "$VENV_DIR" ]; then
         echo "Creating Python virtual environment..."
-        python3 -m venv $VENV_DIR
+        # Try with sudo if available
+        if command -v sudo &> /dev/null; then
+            echo "Using sudo to create virtual environment..."
+            sudo python3 -m venv "$VENV_DIR"
+            sudo chown -R $USER:$USER "$VENV_DIR"
+        else
+            echo "Creating virtual environment without sudo..."
+            python3 -m venv "$VENV_DIR"
+        fi
     fi
     
-    # Activate virtual environment
-    echo "Activating Python virtual environment..."
-    source $VENV_DIR/bin/activate
-    
-    # Install dependencies from requirements file
-    echo "Installing required packages from requirements-model-download.txt..."
-    pip install --upgrade pip
-    pip install -r requirements-model-download.txt
-    
-    # Run the download_model.py script
-    echo "Running download_model.py..."
-    python download_model.py --model-id "facebook/seamless-m4t-v2-${MODEL_SIZE}" --cache-dir "./models/seamless-m4t-v2-${MODEL_SIZE}"
-    
-    # Deactivate virtual environment
-    deactivate
-    
-    echo "Model download complete."
+    if [ ! -d "$VENV_DIR" ]; then
+        echo "Failed to create virtual environment. Using system Python instead."
+    else
+        echo "Activating virtual environment..."
+        source "$VENV_DIR/bin/activate"
+        
+        # Install required packages in the virtual environment
+        echo "Installing required packages from requirements-model-download.txt..."
+        pip install --upgrade pip
+        pip install -r requirements-model-download.txt
+        
+        # Run the download_model.py script
+        echo "Running download_model.py in virtual environment..."
+        python download_model.py --model-id "facebook/seamless-m4t-v2-${MODEL_SIZE}" --cache-dir "./models/seamless-m4t-v2-${MODEL_SIZE}"
+        
+        # Deactivate the virtual environment
+        deactivate
+        echo "Deactivated virtual environment."
+        
+        echo "Model download complete."
+    fi
 fi
 
 # Check for GPU and set batch size
